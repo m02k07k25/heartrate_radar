@@ -21,7 +21,7 @@ from helpers.radar_config import *
 
 DATA_DIR = "record2/train/data"     # 레이더 저장 (.npy)
 ANS_DIR  = "record2/train/answer"   # ECG 저장 (.csv)
-ECG_PORT = "COM8"
+ECG_PORT = "COM6"
 ECG_BAUD = 1_000_000
 
 # ECG 피크 검출 파라미터

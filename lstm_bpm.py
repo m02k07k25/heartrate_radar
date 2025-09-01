@@ -21,18 +21,18 @@ from typing import Tuple, List, Optional, Dict
 
 # ===== 학습 파라미터 =====
 EPOCHS = 1000                   # 에포크
-LEARNING_RATE = 5e-5          # 직접 BPM 예측용 낮은 학습률
-HIDDEN_DIM = 256
-NUM_LAYERS = 2                # LSTM 레이어 2층 및 드롭아웃 적용
+LEARNING_RATE = 1e-4          # 직접 BPM 예측용 낮은 학습률
+HIDDEN_DIM = 128
+NUM_LAYERS = 1                # LSTM 레이어 2층 및 드롭아웃 적용
 
 VALIDATION_SPLIT = 0.25       # 검증 데이터 비율 (20%로 줄임)
-EARLY_STOP_PATIENCE = 200      # 얼리 스탑 인내심 (에포크) - 더 여유롭게
-EARLY_STOP_MIN_DELTA = 1e-6   # 최소 개선 임계값 - 더 관대하게
+EARLY_STOP_PATIENCE = 100      # 얼리 스탑 인내심 (에포크) - 더 여유롭게
+EARLY_STOP_MIN_DELTA = 1e-5   # 최소 개선 임계값 - 더 관대하게
 
 # ===== 스케줄러 파라미터 =====
 SCHEDULER_FACTOR = 0.5        # 학습률 감소 비율
-SCHEDULER_PATIENCE = 100       # 스케줄러 인내심 (에포크)
-SCHEDULER_MIN_LR = 1e-6       # 최소 학습률
+SCHEDULER_PATIENCE = 60       # 스케줄러 인내심 (에포크)
+SCHEDULER_MIN_LR = 1e-5       # 최소 학습률
 
 # ===== 신호 처리 파라미터 =====
 FS          = 36.0            # 프레임레이트 (Hz)
@@ -133,7 +133,7 @@ def load_ground_truth(path: str) -> Optional[np.ndarray]:
                 continue
     return np.array(timestamps, dtype=np.float32) if timestamps else None
 
-def create_bpm_labels(gt_times, z_tau, window_sec=4.0):
+def create_bpm_labels(gt_times, z_tau, window_sec=8.0):
     """ECG 타임스탬프로부터 구간의 평균 BPM 라벨 생성
     
     IBI(Inter-Beat Interval) 기반으로 정확한 BPM 계산:
@@ -210,7 +210,7 @@ def create_training_data(all_z_tau: List[np.ndarray], all_gt_times: List[np.ndar
         selections_per_bucket[bucket_idx] += 1
     
     # 각 구간에서 랜덤하게 선택
-    np.random.seed(42)  # 재현성을 위한 시드 고정
+    rng = np.random.default_rng(42)  # 재현성을 위해 별도의 Generator 사용
     for bucket_idx in range(num_buckets):
         start_idx = bucket_idx * bucket_size
         end_idx = min(start_idx + bucket_size, num_files)
@@ -219,7 +219,7 @@ def create_training_data(all_z_tau: List[np.ndarray], all_gt_times: List[np.ndar
         # 이 구간에서 선택할 개수만큼 랜덤 샘플링
         num_selections = selections_per_bucket[bucket_idx]
         if num_selections > 0 and len(bucket_files) > 0:
-            selected = np.random.choice(bucket_files, 
+            selected = rng.choice(bucket_files,
                                       size=min(num_selections, len(bucket_files)), 
                                       replace=False)
             val_indices.extend(selected)
@@ -266,11 +266,11 @@ class BPMRegressionModel(nn.Module):
         self.conv1d = nn.Sequential(
             nn.Conv1d(1, 64, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv1d(64, 64, kernel_size=3, padding=1),  # 출력 채널을 64로 증가
-            nn.ReLU(inplace=True),
+            # nn.BatchNorm1d(64),
+            # nn.Conv1d(64, 64, kernel_size=3, padding=1),  # 출력 채널을 64로 증가
+            # nn.ReLU(inplace=True),
             nn.AdaptiveAvgPool1d(1),   # (N,64,1)
-            nn.Flatten(1),             # (N,64)
-            nn.LayerNorm(64),          # 채널 축(64)에 LN 적용
+            nn.Flatten(1)              # (N,64)
         )
         
         # LSTM: 시계열 패턴 학습
@@ -278,7 +278,7 @@ class BPMRegressionModel(nn.Module):
             input_size=64,  # CNN 출력 차원 
             hidden_size=hidden,
             num_layers=num_layers,
-            dropout=0.3,   # 층 사이 드롭아웃 (num_layers>1에서만 작동)
+            # dropout=0.3,   # 층 사이 드롭아웃 (num_layers>1에서만 작동)
             batch_first=True
         )
         
@@ -298,8 +298,8 @@ class BPMRegressionModel(nn.Module):
         
         # 마지막 레이어를 적절한 범위로 재초기화
         with torch.no_grad():
-            # self.regressor[-1].weight.normal_(0, 0.01)  # 작은 가중치
-            self.regressor[-1].bias.fill_(100.0)  # 중간값으로 편향 초기화
+            self.regressor[-1].weight.normal_(0, 0.05)
+            self.regressor[-1].bias.zero_()
         
         # 모델 구조 출력
         print(f"BPM 회귀 모델 구조:")
@@ -324,6 +324,45 @@ class BPMRegressionModel(nn.Module):
                         nn.init.xavier_uniform_(param)
                     elif 'bias' in name:
                         nn.init.zeros_(param)
+    
+    def _calculate_train_labels_mean(self) -> float:
+        """훈련 라벨의 평균값을 계산하여 바이어스 초기화에 사용"""
+        try:
+            # 훈련 데이터 디렉토리에서 모든 정답 파일을 읽어서 BPM 평균 계산
+            train_answer_dir = TRAIN_ANSWER_DIR
+            if not os.path.exists(train_answer_dir):
+                print("[WARNING] 훈련 정답 디렉토리를 찾을 수 없습니다. 기본값 80.0 사용")
+                return 80.0
+            
+            all_bpms = []
+            answer_files = [f for f in os.listdir(train_answer_dir) if f.endswith('.csv')]
+            
+            for answer_file in answer_files:
+                answer_path = os.path.join(train_answer_dir, answer_file)
+                try:
+                    gt_times = load_ground_truth(answer_path)
+                    if gt_times is not None and len(gt_times) > 1:
+                        # 시간 간격으로 BPM 계산
+                        time_span = gt_times[-1] - gt_times[0]
+                        if time_span > 0:
+                            bpm = 60.0 * (len(gt_times) - 1) / time_span
+                            if 30 <= bpm <= 200:  # 유효한 BPM 범위
+                                all_bpms.append(bpm)
+                except Exception as e:
+                    print(f"[WARNING] {answer_file} 처리 중 오류: {e}")
+                    continue
+            
+            if all_bpms:
+                mean_bpm = np.mean(all_bpms)
+                print(f"[INFO] 훈련 라벨 평균 계산 완료: {len(all_bpms)}개 파일, 평균 BPM: {mean_bpm:.2f}")
+                return float(mean_bpm)
+            else:
+                print("[WARNING] 유효한 BPM 데이터를 찾을 수 없습니다. 기본값 80.0 사용")
+                return 80.0
+                
+        except Exception as e:
+            print(f"[WARNING] 훈련 라벨 평균 계산 중 오류: {e}. 기본값 80.0 사용")
+            return 80.0
         
     def forward(self, x: torch.Tensor, hidden: Optional[Tuple] = None) -> Tuple[torch.Tensor, Tuple]:
         """
@@ -352,9 +391,11 @@ class BPMRegressionModel(nn.Module):
         
         # LSTM 처리
         lstm_out, hidden = self.lstm(conv_out, hidden)
-        
+        # lstm_out, hidden = self.lstm(x, hidden)
+
         # 마지막 시점의 출력만 사용 (시퀀스 전체를 고려한 BPM 예측)
-        last_output = lstm_out[:, -1, :]  # (batch, hidden_dim)
+        # last_output = lstm_out[:, -1, :]  # (batch, hidden_dim)
+        last_output = lstm_out.mean(dim=1)  # (batch, hidden_dim)
         
         # 직접 BPM 회귀 (선형 출력, 클리핑 제거)
         bpm_pred = self.regressor(last_output)  # (batch, 1)
@@ -477,10 +518,7 @@ class BPMPredictor:
         # return np.array(sub_features, dtype=np.float32)  # shape: (16, FEATURE_DIM)
          # (8, FEATURE_DIM)으로 결합
         feats = np.array(sub_features, dtype=np.float32)  # (8, 36)
-        # 서브구간(행)별 z-score 정규화 → 파일/거리/진폭 차에 덜 민감
-        mu  = feats.mean(axis=1, keepdims=True)
-        std = feats.std(axis=1, keepdims=True) + 1e-6
-        feats = (feats - mu) / std
+        # 서브구간(행)별 z-score 정규화 제거: 크기/스케일 정보 보존
         return feats
     
 
@@ -493,7 +531,14 @@ class BPMPredictor:
         self.model = BPMRegressionModel(input_dim=FEATURE_DIM).to(self.device)
         print(f"모델 파라미터 수: {sum(p.numel() for p in self.model.parameters()):,}")
         
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=LEARNING_RATE)
+        # 파라미터 그룹: 마지막 회귀 레이어에 더 큰 학습률 (항등성으로 분리)
+        last_layer_params = list(self.model.regressor[-1].parameters())
+        last_param_ids = {id(p) for p in last_layer_params}
+        other_params = [p for p in self.model.parameters() if id(p) not in last_param_ids]
+        optimizer = torch.optim.Adam([
+            {"params": other_params, "lr": LEARNING_RATE},
+            {"params": last_layer_params, "lr": LEARNING_RATE * 5.0},
+        ])
         criterion = torch.nn.SmoothL1Loss(beta=4.0)  # Huber loss
         
         # 학습률 스케줄러 추가 (검증 손실 기반)
@@ -552,8 +597,8 @@ class BPMPredictor:
                 optimizer.zero_grad()
                 bpm_pred, _ = self.model(features, None)
                 
-                loss = F.mse_loss(bpm_pred.squeeze(), labels)
-                # loss = criterion(bpm_pred.squeeze(), labels) # Huber loss
+                # loss = F.mse_loss(bpm_pred.squeeze(), labels)
+                loss = criterion(bpm_pred.squeeze(), labels) # Huber loss
                 mae = F.l1_loss(bpm_pred.squeeze(), labels)
                 
                 loss.backward()
@@ -577,7 +622,8 @@ class BPMPredictor:
                     
                     bpm_pred, _ = self.model(features, None)
                     
-                    loss = F.mse_loss(bpm_pred.squeeze(), labels)
+                    # 훈련과 동일한 Huber Loss 사용
+                    loss = criterion(bpm_pred.squeeze(), labels)
                     mae = F.l1_loss(bpm_pred.squeeze(), labels)
                     
                     val_loss += loss.item()
