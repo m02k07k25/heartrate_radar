@@ -19,9 +19,36 @@ from helpers.preproc_signal import range_axis_m
 from helpers.radar_config import FS_ADC, PAD_FT, B_HZ, NUM_SAMPLES
 from typing import Tuple, List, Optional, Dict
 
-# --------------------------------------------------------------------------------
-# 시드 고정 (재현성)
-# --------------------------------------------------------------------------------
+# ===== 학습 파라미터 =====
+EPOCHS = 1000                   # 에포크
+LEARNING_RATE = 5e-5          # 직접 BPM 예측용 낮은 학습률
+HIDDEN_DIM = 256
+NUM_LAYERS = 2                # LSTM 레이어 2층 및 드롭아웃 적용
+
+VALIDATION_SPLIT = 0.25       # 검증 데이터 비율 (20%로 줄임)
+EARLY_STOP_PATIENCE = 200      # 얼리 스탑 인내심 (에포크) - 더 여유롭게
+EARLY_STOP_MIN_DELTA = 1e-6   # 최소 개선 임계값 - 더 관대하게
+
+# ===== 스케줄러 파라미터 =====
+SCHEDULER_FACTOR = 0.5        # 학습률 감소 비율
+SCHEDULER_PATIENCE = 100       # 스케줄러 인내심 (에포크)
+SCHEDULER_MIN_LR = 1e-6       # 최소 학습률
+
+# ===== 신호 처리 파라미터 =====
+FS          = 36.0            # 프레임레이트 (Hz)
+WIN_FRAMES  = int(8.0 * FS)   # 8초 윈도우 = 288 프레임
+HOP_FRAMES  = 18*2            # 1초 홉 18*2프레임
+FMIN, FMAX  = 0.5, 3.33       # 심박 대역 [Hz] (30-200 BPM에 대응)
+PAD_FACTOR  = 8               # FFT 패딩 (주파수 해상도 향상)
+FEATURE_DIM = 36              # 1D CNN으로 압축할 특징 차원
+
+# ===== 경로 설정 =====
+TRAIN_DATA_DIR = "record2/train/data/"
+TRAIN_ANSWER_DIR = "record2/train/answer/"
+TEST_DATA_DIR = "record2/test/data/"
+TEST_ANSWER_DIR = "record2/test/answer/"
+
+# ===== 시드 고정 (재현성) =====
 seed = 42
 os.environ["PYTHONHASHSEED"] = str(seed)
 np.random.seed(seed)
@@ -36,35 +63,6 @@ except Exception:
     pass
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
-
-# ===== 경로 설정 =====
-TRAIN_DATA_DIR = "record2/train/data/"
-TRAIN_ANSWER_DIR = "record2/train/answer/"
-TEST_DATA_DIR = "record2/test/data/"
-TEST_ANSWER_DIR = "record2/test/answer/"
-
-# ===== 신호 처리 파라미터 =====
-FS          = 36.0            # 프레임레이트 (Hz)
-WIN_FRAMES  = int(8.0 * FS)   # 8초 윈도우 = 288 프레임
-HOP_FRAMES  = 18*2            # 1초 홉 18*2프레임
-FMIN, FMAX  = 0.5, 3.33       # 심박 대역 [Hz] (30-200 BPM에 대응)
-PAD_FACTOR  = 8               # FFT 패딩 (주파수 해상도 향상)
-FEATURE_DIM = 36              # 1D CNN으로 압축할 특징 차원
-
-# ===== 학습 파라미터 =====
-EPOCHS = 1000                   # 에포크
-LEARNING_RATE = 5e-4          # 직접 BPM 예측용 낮은 학습률
-HIDDEN_DIM = 128
-NUM_LAYERS = 2                # LSTM 레이어 2층 및 드롭아웃 적용
-
-VALIDATION_SPLIT = 0.25       # 검증 데이터 비율 (20%로 줄임)
-EARLY_STOP_PATIENCE = 100      # 얼리 스탑 인내심 (에포크) - 더 여유롭게
-EARLY_STOP_MIN_DELTA = 1e-4   # 최소 개선 임계값 - 더 관대하게
-
-# ===== 스케줄러 파라미터 =====
-SCHEDULER_FACTOR = 0.75        # 학습률 감소 비율
-SCHEDULER_PATIENCE = 30       # 스케줄러 인내심 (에포크)
-SCHEDULER_MIN_LR = 1e-6       # 최소 학습률
 
 # ===== 파일 처리 함수들 =====
 
@@ -264,17 +262,15 @@ class BPMRegressionModel(nn.Module):
     def __init__(self, input_dim: int = FEATURE_DIM, hidden: int = HIDDEN_DIM, num_layers: int = NUM_LAYERS):
         super().__init__()
         
-        # 1D CNN: 주파수 특징 압축 및 추출
+        # 1D CNN: 주파수 특징 압축 및 추출 (LN을 CNN 끝단에 적용)
         self.conv1d = nn.Sequential(
             nn.Conv1d(1, 64, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
-            # nn.BatchNorm1d(64),
-            nn.GroupNorm(8, 64),          # ← BatchNorm1d(64) → GroupNorm(8,64)
             nn.Conv1d(64, 64, kernel_size=3, padding=1),  # 출력 채널을 64로 증가
             nn.ReLU(inplace=True),
-            # nn.BatchNorm1d(64),
-            nn.GroupNorm(8, 64),          # ← BatchNorm1d(64) → GroupNorm(8,64)
-            nn.AdaptiveAvgPool1d(1),  # 각 채널을 1차원으로 압축 → (batch, 64, 1)
+            nn.AdaptiveAvgPool1d(1),   # (N,64,1)
+            nn.Flatten(1),             # (N,64)
+            nn.LayerNorm(64),          # 채널 축(64)에 LN 적용
         )
         
         # LSTM: 시계열 패턴 학습
@@ -507,7 +503,6 @@ class BPMPredictor:
             factor=SCHEDULER_FACTOR,  # 학습률 감소 비율
             patience=SCHEDULER_PATIENCE,  # 인내심
             min_lr=SCHEDULER_MIN_LR,     # 최소 학습률
-            verbose=True          # 학습률 변경 시 출력
         )
 
         print(f"\n=== 배치 학습 시작 (에포크: {EPOCHS}, 배치크기: {batch_size}) ===")
@@ -593,8 +588,13 @@ class BPMPredictor:
             avg_val_mae = val_mae / max(1, val_batch_count)
             
             # 스케줄러 스텝 (검증 손실 기반)
+            old_lr = optimizer.param_groups[0]['lr']
             scheduler.step(avg_val_loss)
             current_lr = optimizer.param_groups[0]['lr']
+            
+            # 학습률 변경 감지 및 출력
+            if current_lr != old_lr:
+                print(f"🔽 학습률 감소: {old_lr:.2e} → {current_lr:.2e}")
             
             # 얼리 스탑 체크
             if avg_val_loss < best_val_loss - EARLY_STOP_MIN_DELTA:
