@@ -53,18 +53,18 @@ FEATURE_DIM = 36              # 1D CNN으로 압축할 특징 차원
 
 # ===== 학습 파라미터 =====
 EPOCHS = 1000                   # 에포크
-LEARNING_RATE = 5e-5          # 직접 BPM 예측용 낮은 학습률
+LEARNING_RATE = 5e-4          # 직접 BPM 예측용 낮은 학습률
 HIDDEN_DIM = 128
 NUM_LAYERS = 2                # LSTM 레이어 2층 및 드롭아웃 적용
 
 VALIDATION_SPLIT = 0.25       # 검증 데이터 비율 (20%로 줄임)
-EARLY_STOP_PATIENCE = 500      # 얼리 스탑 인내심 (에포크) - 더 여유롭게
+EARLY_STOP_PATIENCE = 100      # 얼리 스탑 인내심 (에포크) - 더 여유롭게
 EARLY_STOP_MIN_DELTA = 1e-4   # 최소 개선 임계값 - 더 관대하게
 
 # ===== 스케줄러 파라미터 =====
-SCHEDULER_FACTOR = 0.25        # 학습률 감소 비율
+SCHEDULER_FACTOR = 0.75        # 학습률 감소 비율
 SCHEDULER_PATIENCE = 30       # 스케줄러 인내심 (에포크)
-SCHEDULER_MIN_LR = 1e-7       # 최소 학습률
+SCHEDULER_MIN_LR = 1e-6       # 최소 학습률
 
 # ===== 파일 처리 함수들 =====
 
@@ -135,7 +135,7 @@ def load_ground_truth(path: str) -> Optional[np.ndarray]:
                 continue
     return np.array(timestamps, dtype=np.float32) if timestamps else None
 
-def create_bpm_labels(gt_times, z_tau, window_sec=3.0):
+def create_bpm_labels(gt_times, z_tau, window_sec=4.0):
     """ECG 타임스탬프로부터 구간의 평균 BPM 라벨 생성
     
     IBI(Inter-Beat Interval) 기반으로 정확한 BPM 계산:
@@ -193,16 +193,41 @@ def create_training_data(all_z_tau: List[np.ndarray], all_gt_times: List[np.ndar
     
     print(f"데이터 생성 완료: {len(file_features)}개 파일")
     
-    # sklearn의 train_test_split을 사용하여 파일 단위로 분할
-    file_indices = list(range(len(file_features)))
+    # 구간마다 골고루 랜덤 선택으로 검증 데이터 분할
+    num_files = len(file_features)
+    num_val_files = max(1, int(round(num_files * VALIDATION_SPLIT)))
+    num_val_files = min(num_val_files, num_files)
     
-    # train_test_split으로 파일 인덱스 분할 (파일 단위 분할)
-    train_indices, val_indices = train_test_split(
-        file_indices, 
-        test_size=VALIDATION_SPLIT, 
-        random_state=42,  # 재현성을 위한 시드 고정
-        shuffle=True      # 파일 순서를 랜덤하게 섞음
-    )
+    # 20개 단위 구간으로 나누어 각 구간에서 랜덤하게 선택 (1~20, 21~40, 41~60, ...)
+    bucket_size = 20
+    val_indices = []
+    
+    # 각 구간에서 선택할 개수 계산 (라운드로빈)
+    num_buckets = (num_files + bucket_size - 1) // bucket_size  # 올림 계산
+    selections_per_bucket = [0] * num_buckets
+    
+    # 필요한 검증 파일 수를 구간에 골고루 분배
+    for i in range(num_val_files):
+        bucket_idx = i % num_buckets
+        selections_per_bucket[bucket_idx] += 1
+    
+    # 각 구간에서 랜덤하게 선택
+    np.random.seed(42)  # 재현성을 위한 시드 고정
+    for bucket_idx in range(num_buckets):
+        start_idx = bucket_idx * bucket_size
+        end_idx = min(start_idx + bucket_size, num_files)
+        bucket_files = list(range(start_idx, end_idx))
+        
+        # 이 구간에서 선택할 개수만큼 랜덤 샘플링
+        num_selections = selections_per_bucket[bucket_idx]
+        if num_selections > 0 and len(bucket_files) > 0:
+            selected = np.random.choice(bucket_files, 
+                                      size=min(num_selections, len(bucket_files)), 
+                                      replace=False)
+            val_indices.extend(selected)
+    
+    # 훈련 인덱스는 검증 인덱스를 제외한 나머지
+    train_indices = [i for i in range(num_files) if i not in set(val_indices)]
     
     # 훈련 데이터 결합
     train_features = []
@@ -224,7 +249,8 @@ def create_training_data(all_z_tau: List[np.ndarray], all_gt_times: List[np.ndar
     X_val = np.array(val_features, dtype=np.float32)
     y_val = np.array(val_labels, dtype=np.float32)
     
-    print(f"파일 단위 데이터 분할 완료 (sklearn train_test_split 사용):")
+    print(f"파일 단위 데이터 분할 완료 (구간별 골고루 랜덤 샘플링):")
+    print(f"  검증 파일 인덱스: {sorted(val_indices)}")
     print(f"  훈련 파일: {len(train_indices)}개, 윈도우: {len(X_train)}개")
     print(f"  검증 파일: {len(val_indices)}개, 윈도우: {len(X_val)}개")
     
@@ -277,7 +303,7 @@ class BPMRegressionModel(nn.Module):
         # 마지막 레이어를 적절한 범위로 재초기화
         with torch.no_grad():
             # self.regressor[-1].weight.normal_(0, 0.01)  # 작은 가중치
-            self.regressor[-1].bias.fill_(80.0)  # 중간값으로 편향 초기화
+            self.regressor[-1].bias.fill_(100.0)  # 중간값으로 편향 초기화
         
         # 모델 구조 출력
         print(f"BPM 회귀 모델 구조:")
@@ -472,7 +498,7 @@ class BPMPredictor:
         print(f"모델 파라미터 수: {sum(p.numel() for p in self.model.parameters()):,}")
         
         optimizer = torch.optim.Adam(self.model.parameters(), lr=LEARNING_RATE)
-        criterion = torch.nn.SmoothL1Loss(beta=1.0)  # Huber loss
+        criterion = torch.nn.SmoothL1Loss(beta=4.0)  # Huber loss
         
         # 학습률 스케줄러 추가 (검증 손실 기반)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
