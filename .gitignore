@@ -1,0 +1,8 @@
+# Python
+__pycache__/
+.venv/
+.env
+.env.* 
+
+# Project data & artifacts (대용량/민감)
+record*/**/raw_*.npy
