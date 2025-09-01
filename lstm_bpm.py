@@ -22,7 +22,7 @@ from typing import Tuple, List, Optional, Dict
 # ===== 학습 파라미터 =====
 EPOCHS = 1000                   # 에포크
 LEARNING_RATE = 1e-4          # 직접 BPM 예측용 낮은 학습률
-HIDDEN_DIM = 128
+HIDDEN_DIM = 256
 NUM_LAYERS = 1                # LSTM 레이어 2층 및 드롭아웃 적용
 
 VALIDATION_SPLIT = 0.25       # 검증 데이터 비율 (20%로 줄임)
@@ -38,8 +38,8 @@ SCHEDULER_MIN_LR = 1e-5       # 최소 학습률
 FS          = 36.0            # 프레임레이트 (Hz)
 WIN_FRAMES  = int(8.0 * FS)   # 8초 윈도우 = 288 프레임
 HOP_FRAMES  = 18*2            # 1초 홉 18*2프레임
-FMIN, FMAX  = 0.5, 3.33       # 심박 대역 [Hz] (30-200 BPM에 대응)
-PAD_FACTOR  = 8               # FFT 패딩 (주파수 해상도 향상)
+# FMIN, FMAX  = 0.5, 3.33       # 심박 대역 [Hz] (30-200 BPM에 대응)
+# PAD_FACTOR  = 8               # FFT 패딩 (주파수 해상도 향상)
 FEATURE_DIM = 36              # 1D CNN으로 압축할 특징 차원
 
 # ===== 경로 설정 =====
@@ -133,13 +133,11 @@ def load_ground_truth(path: str) -> Optional[np.ndarray]:
                 continue
     return np.array(timestamps, dtype=np.float32) if timestamps else None
 
-def create_bpm_labels(gt_times, z_tau, window_sec=8.0):
+def create_bpm_labels(gt_times, z_tau, window_sec=3.0):
     """ECG 타임스탬프로부터 구간의 평균 BPM 라벨 생성
     
     IBI(Inter-Beat Interval) 기반으로 정확한 BPM 계산:
     - 구간 내 비트 2개 이상: IBI 평균으로 BPM 계산 (60 / mean_IBI)
-    - 구간 내 비트 1개: 이웃 비트들과의 IBI 사용
-    - 구간 내 비트 0개: 기본값 60 BPM
     """
     T = len(z_tau); labels = []
     for i in range(WIN_FRAMES, T, HOP_FRAMES):
@@ -246,6 +244,16 @@ def create_training_data(all_z_tau: List[np.ndarray], all_gt_times: List[np.ndar
     y_train = np.array(train_labels, dtype=np.float32)
     X_val = np.array(val_features, dtype=np.float32)
     y_val = np.array(val_labels, dtype=np.float32)
+
+    # 라벨 정규화 통계 (훈련 세트 기준)
+    predictor.label_mean = float(np.mean(y_train)) if len(y_train) > 0 else 0.0
+    predictor.label_std = float(np.std(y_train) + 1e-6) if len(y_train) > 0 else 1.0
+    print(f"라벨 정규화 통계: mean={predictor.label_mean:.2f}, std={predictor.label_std:.2f}")
+
+    # 라벨 표준화
+    if predictor.label_std > 0:
+        y_train = (y_train - predictor.label_mean) / predictor.label_std
+        y_val = (y_val - predictor.label_mean) / predictor.label_std
     
     print(f"파일 단위 데이터 분할 완료 (구간별 골고루 랜덤 샘플링):")
     print(f"  검증 파일 인덱스: {sorted(val_indices)}")
@@ -270,7 +278,8 @@ class BPMRegressionModel(nn.Module):
             # nn.Conv1d(64, 64, kernel_size=3, padding=1),  # 출력 채널을 64로 증가
             # nn.ReLU(inplace=True),
             nn.AdaptiveAvgPool1d(1),   # (N,64,1)
-            nn.Flatten(1)              # (N,64)
+            nn.Flatten(1),              # (N,64)
+            nn.LayerNorm(64),   # ★ 한 줄
         )
         
         # LSTM: 시계열 패턴 학습
@@ -394,8 +403,8 @@ class BPMRegressionModel(nn.Module):
         # lstm_out, hidden = self.lstm(x, hidden)
 
         # 마지막 시점의 출력만 사용 (시퀀스 전체를 고려한 BPM 예측)
-        # last_output = lstm_out[:, -1, :]  # (batch, hidden_dim)
-        last_output = lstm_out.mean(dim=1)  # (batch, hidden_dim)
+        last_output = lstm_out[:, -1, :]  # (batch, hidden_dim)
+        # last_output = lstm_out.mean(dim=1)  # (batch, hidden_dim)
         
         # 직접 BPM 회귀 (선형 출력, 클리핑 제거)
         bpm_pred = self.regressor(last_output)  # (batch, 1)
@@ -419,6 +428,9 @@ class BPMPredictor:
         self.train_answer_dir = train_answer_dir
         self.model = None
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # 라벨 정규화 통계 (훈련 시 계산)
+        self.label_mean: Optional[float] = None
+        self.label_std: Optional[float] = None
         print(f"디바이스: {self.device}")
         print(f"학습 데이터 경로: {train_data_dir}")
         print(f"학습 정답 경로: {train_answer_dir}")
@@ -539,7 +551,17 @@ class BPMPredictor:
             {"params": other_params, "lr": LEARNING_RATE},
             {"params": last_layer_params, "lr": LEARNING_RATE * 5.0},
         ])
-        criterion = torch.nn.SmoothL1Loss(beta=4.0)  # Huber loss
+        
+        # 학습/검증 데이터 생성 및 DataLoader 설정
+        X_train, y_train, X_val, y_val = create_training_data(all_z_tau, all_gt_times, self)
+        
+        # 라벨 정규화 통계 계산 후 Huber Loss의 beta 조정
+        beta_bpm = 3.0                             # 2~4 BPM 중 하나로 튜닝
+        beta_std = beta_bpm / self.label_std        # z-스케일 임계치
+        
+        criterion = torch.nn.SmoothL1Loss(beta=beta_std)
+        print(f"Huber Loss beta 조정: {beta_bpm} BPM -> {beta_std:.3f} (z-scale)")
+        # criterion = torch.nn.SmoothL1Loss(beta=4.0)  # Huber loss
         
         # 학습률 스케줄러 추가 (검증 손실 기반)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -553,9 +575,6 @@ class BPMPredictor:
         print(f"\n=== 배치 학습 시작 (에포크: {EPOCHS}, 배치크기: {batch_size}) ===")
         print(f"검증 데이터 비율: {VALIDATION_SPLIT*100:.0f}%, 얼리 스탑 인내심: {EARLY_STOP_PATIENCE} 에포크")
         print(f"스케줄러: ReduceLROnPlateau (factor={SCHEDULER_FACTOR}, patience={SCHEDULER_PATIENCE})")
-        
-        # 학습/검증 데이터 생성 및 DataLoader 설정
-        X_train, y_train, X_val, y_val = create_training_data(all_z_tau, all_gt_times, self)
         
         train_dataset = TensorDataset(X_train, y_train)
         val_dataset = TensorDataset(X_val, y_val)
@@ -598,8 +617,14 @@ class BPMPredictor:
                 bpm_pred, _ = self.model(features, None)
                 
                 # loss = F.mse_loss(bpm_pred.squeeze(), labels)
-                loss = criterion(bpm_pred.squeeze(), labels) # Huber loss
-                mae = F.l1_loss(bpm_pred.squeeze(), labels)
+                loss = criterion(bpm_pred.squeeze(), labels) # Huber loss (정규화 라벨 기준)
+                # MAE는 BPM 단위로 계산 (역정규화)
+                if (self.label_mean is not None) and (self.label_std is not None):
+                    pred_bpm = bpm_pred.squeeze() * self.label_std + self.label_mean
+                    true_bpm = labels * self.label_std + self.label_mean
+                    mae = F.l1_loss(pred_bpm, true_bpm)
+                else:
+                    mae = F.l1_loss(bpm_pred.squeeze(), labels)
                 
                 loss.backward()
                 optimizer.step()
@@ -622,9 +647,15 @@ class BPMPredictor:
                     
                     bpm_pred, _ = self.model(features, None)
                     
-                    # 훈련과 동일한 Huber Loss 사용
+                    # 훈련과 동일한 Huber Loss 사용 (정규화 라벨 기준)
                     loss = criterion(bpm_pred.squeeze(), labels)
-                    mae = F.l1_loss(bpm_pred.squeeze(), labels)
+                    # MAE는 BPM 단위로 계산 (역정규화)
+                    if (self.label_mean is not None) and (self.label_std is not None):
+                        pred_bpm = bpm_pred.squeeze() * self.label_std + self.label_mean
+                        true_bpm = labels * self.label_std + self.label_mean
+                        mae = F.l1_loss(pred_bpm, true_bpm)
+                    else:
+                        mae = F.l1_loss(bpm_pred.squeeze(), labels)
                     
                     val_loss += loss.item()
                     val_mae += mae.item()
@@ -681,7 +712,11 @@ class BPMPredictor:
                 x = torch.FloatTensor(features).unsqueeze(0).to(self.device)
                 
                 bpm_pred, _ = self.model(x, None)
-                predictions.append(bpm_pred.cpu().item())
+                y = bpm_pred.cpu().item()
+                # 역정규화(라벨 정규화가 존재하는 경우)
+                if (self.label_mean is not None) and (self.label_std is not None):
+                    y = y * self.label_std + self.label_mean
+                predictions.append(y)
                 
         return predictions
     
@@ -730,7 +765,7 @@ class BPMPredictor:
         print(f"\n=== 구간별 BPM 예측 성능 평가 ===")
         
         # 원하는 구간 길이(초)와 현재 홉 간격으로부터 구간 당 윈도우 개수 계산
-        target_interval_sec = 6.5
+        target_interval_sec = 4
         step_seconds = HOP_FRAMES / FS
         total_duration = len(z_tau) / FS
         interval_size = max(1, int(round(target_interval_sec / step_seconds)))
@@ -811,7 +846,7 @@ class BPMPredictor:
             print(f"평균 MAE: {avg_mae:.2f} ± {std_mae:.2f} BPM")
             print(f"테스트 파일 수: {len(all_rmse)}개")
     
-    def run(self, test_data_dir=None, test_answer_dir=None, batch_size=32):
+    def run(self, test_data_dir=None, test_answer_dir=None, batch_size=64):
         """전체 실행"""
         # 1. 모든 학습 데이터 로딩
         all_z_tau, all_gt_times = self.load_all_training_data()
