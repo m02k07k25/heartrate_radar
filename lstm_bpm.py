@@ -485,8 +485,8 @@ class BPMPredictor:
         
         # 8초 전체에 먼저 BPF 적용: 50 BPM 이상 (0.83 Hz 이상) 통과, 5차 필터 사용
         # 50 BPM = 0.83 Hz, 200 BPM = 3.33 Hz
-        low_freq = 1.0  # Hz (50 BPM)
-        high_freq = 2.6  # Hz (160 BPM)
+        low_freq = 0.8  # Hz (48 BPM)
+        high_freq = 3.0  # Hz (180 BPM)
         
         # 5차 Butterworth BPF 설계
         from scipy.signal import butter, filtfilt

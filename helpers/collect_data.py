@@ -130,24 +130,40 @@ def radar_thread():
             print(f"[RADAR] 전처리 시작...")
             processed_data = process_radar_data(data_buffer)
 
-            # === 품질 알림: 위상 일관성 C, HR-SNR(dB) 계산 ===
+            # === 품질 알림: 호흡/심박수별 위상 일관성, HR-SNR 계산 ===
             z_tau = processed_data.get('z_tau', None)
             if z_tau is not None:
                 fs = 1.0 / RADAR_CFG.frame_repetition_time_s
-                # 0.30 Hz HPF로 드리프트/호흡 억제 → HR 품질 평가
-                bhp, ahp = butter(2, 0.30/(fs/2), btype='highpass')
+                
+                # 호흡용 HPF: 0.1 Hz 이상 통과 (호흡 주기 2-10초)
+                bhp_resp, ahp_resp = butter(2, 0.1/(fs/2), btype='highpass')
+                
+                # 심박수용 HPF: 0.5 Hz 이상 통과 (심박수 30 BPM 이상)
+                bhp_hr, ahp_hr = butter(2, 0.5/(fs/2), btype='highpass')
+                
                 phi = np.unwrap(np.angle(z_tau)).astype(np.float32)
-                phi_d = filtfilt(bhp, ahp, phi)
-                C = float(np.abs(np.mean(np.exp(1j*phi_d))))
+                
+                # 호흡 품질 평가
+                phi_resp = filtfilt(bhp_resp, ahp_resp, phi)
+                C_resp = float(np.abs(np.mean(np.exp(1j*phi_resp))))
+                
+                # 심박수 품질 평가
+                phi_hr = filtfilt(bhp_hr, ahp_hr, phi)
+                C_hr = float(np.abs(np.mean(np.exp(1j*phi_hr))))
+                
                 # Welch 기반 HR-SNR 계산 (HR: 0.8–3.0 Hz, Noise: 3.5–5.0 Hz)
-                nper = min(len(phi_d), int(fs*8))
+                nper = min(len(phi_hr), int(fs*8))
                 nover = nper//2
-                f, Pxx = welch(phi_d, fs=fs, nperseg=nper, noverlap=nover)
+                f, Pxx = welch(phi_hr, fs=fs, nperseg=nper, noverlap=nover)
                 hr_band = (f >= 0.8) & (f <= 3.0)
                 nz_band = (f >= 3.5) & (f <= 5.0)
                 snr_db = 10.0*np.log10((Pxx[hr_band].sum()+1e-12)/(Pxx[nz_band].sum()+1e-12))
-                print(f"[QUALITY] fc_bin={processed_data.get('fc_bin')}  C={C:.2f}  HR-SNR={snr_db:.1f} dB")
-                if (C < 0.30) or (snr_db < 6.0):
+                
+                print(f"[QUALITY] fc_bin={processed_data.get('fc_bin')}")
+                print(f"  호흡 품질: C={C_resp:.2f}")
+                print(f"  심박수 품질: C={C_hr:.2f}, HR-SNR={snr_db:.1f} dB")
+                
+                if (C_resp < 0.20) or (C_hr < 0.30) or (snr_db < 6.0):
                     print("---------------⚠️⚠️⚠️-------------")
                     print("[QUALITY] ⚠️⚠️⚠️ 품질 낮음: 자세/거리/각도/환경(반사체) 조정 권장")
 

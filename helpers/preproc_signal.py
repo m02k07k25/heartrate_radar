@@ -144,7 +144,7 @@ def select_fc_by_phase_score(
         # - C: 위상 안정성/일관성 (주기적일수록 1에 가까워짐)
         # - snr_ok: 신호가 노이즈보다 충분히 강한지 여부
         P_br = band_power_welch(phi_d05, fs_frame, 0.10, 0.50)
-        P_hr = band_power_welch(phi_d35, fs_frame, 0.80, 3.50)
+        P_hr = band_power_welch(phi_d35, fs_frame, 0.80, 3.00)
         C = phase_consistency(phi_d35)
         snr_ok = (np.mean(np.abs(z)) > noise * 1.5)
 
