@@ -20,26 +20,26 @@ from helpers.radar_config import FS_ADC, PAD_FT, B_HZ, NUM_SAMPLES
 from typing import Tuple, List, Optional, Dict
 
 # ===== 학습 파라미터 =====
-EPOCHS = 1000                   # 에포크
+EPOCHS = 1000                 # 에포크
 LEARNING_RATE = 1e-4          # 직접 BPM 예측용 낮은 학습률
 HIDDEN_DIM = 256
 NUM_LAYERS = 1                # LSTM 레이어 2층 및 드롭아웃 적용
 
 VALIDATION_SPLIT = 0.25       # 검증 데이터 비율 (20%로 줄임)
-EARLY_STOP_PATIENCE = 100      # 얼리 스탑 인내심 (에포크) - 더 여유롭게
+EARLY_STOP_PATIENCE = 100     # 얼리 스탑 인내심 (에포크) - 더 여유롭게
 EARLY_STOP_MIN_DELTA = 1e-5   # 최소 개선 임계값 - 더 관대하게
 
 # ===== 스케줄러 파라미터 =====
 SCHEDULER_FACTOR = 0.5        # 학습률 감소 비율
-SCHEDULER_PATIENCE = 60       # 스케줄러 인내심 (에포크)
+SCHEDULER_PATIENCE = 30       # 스케줄러 인내심 (에포크)
 SCHEDULER_MIN_LR = 1e-5       # 최소 학습률
 
 # ===== 신호 처리 파라미터 =====
 FS          = 36.0            # 프레임레이트 (Hz)
 WIN_FRAMES  = int(8.0 * FS)   # 8초 윈도우 = 288 프레임
 HOP_FRAMES  = 18*2            # 1초 홉 18*2프레임
-# FMIN, FMAX  = 0.5, 3.33       # 심박 대역 [Hz] (30-200 BPM에 대응)
-# PAD_FACTOR  = 8               # FFT 패딩 (주파수 해상도 향상)
+# FMIN, FMAX  = 0.5, 3.33     # 심박 대역 [Hz] (30-200 BPM에 대응)
+# PAD_FACTOR  = 8             # FFT 패딩 (주파수 해상도 향상)
 FEATURE_DIM = 36              # 1D CNN으로 압축할 특징 차원
 
 # ===== 경로 설정 =====
@@ -482,58 +482,63 @@ class BPMPredictor:
     
     def process_window(self, window: np.ndarray) -> np.ndarray:
         """8초 윈도우를 8개 구간으로 나누어 위상미분 신호를 직접 사용 (FFT 없음)"""
-        # 8초 윈도우를 8개 서브구간으로 분할 (각 1초, 36프레임)
-        sub_intervals = WIN_FRAMES // HOP_FRAMES
-        sub_window_size = HOP_FRAMES
-        sub_features = []
         
-        for i in range(sub_intervals):
-            start_idx = i * sub_window_size
-            end_idx = (i + 1) * sub_window_size if i < sub_intervals - 1 else len(window)
+        # 8초 전체에 먼저 BPF 적용: 50 BPM 이상 (0.83 Hz 이상) 통과, 5차 필터 사용
+        # 50 BPM = 0.83 Hz, 200 BPM = 3.33 Hz
+        low_freq = 1.0  # Hz (50 BPM)
+        high_freq = 2.6  # Hz (160 BPM)
+        
+        # 5차 Butterworth BPF 설계
+        from scipy.signal import butter, filtfilt
+        nyquist = FS / 2.0
+        low_norm = low_freq / nyquist
+        high_norm = high_freq / nyquist
+        
+        # 5차 Butterworth BPF 계수 계산
+        b, a = butter(5, [low_norm, high_norm], btype='band')
+        
+        # 제로패딩으로 필터링 (경계 효과 방지)
+        pad_len = len(window) // 4
+        window_padded = np.pad(window, (pad_len, pad_len), mode='edge')
+        
+        # 양방향 필터링으로 위상 왜곡 방지
+        window_filtered = filtfilt(b, a, window_padded)
+        
+        # 패딩 제거
+        window_filtered = window_filtered[pad_len:-pad_len]
+        
+        # 8초 전체에서 먼저 위상미분 추출 (시간적 연속성 확보)
+        try:
+            # 전체 8초 윈도우에서 위상미분 추출
+            dphi_full = extract_phase_derivative(window_filtered, FS)
             
-            # 서브윈도우 추출
-            sub_window = window[start_idx:end_idx]
+            # 8초 전체 위상미분을 8개 구간으로 분할
+            sub_intervals = WIN_FRAMES // HOP_FRAMES  # 8개 구간
+            sub_window_size = HOP_FRAMES              # 36프레임 = 1초
+            sub_features = []
             
-            # 서브윈도우가 너무 작으면 이전 특징 재사용
-            if len(sub_window) < 5:  # 최소 5프레임 필요
-                print(f"서브윈도우 크기 부족: {len(sub_window)}")
-                raise ValueError(f"서브윈도우 크기 부족: {len(sub_window)}")
-            
-            # 위상미분 신호를 FFT 없이 직접 사용
-            try:
-                # 위상미분 추출 (시간 영역 신호, 13프레임) - BPF 없음
-                dphi = extract_phase_derivative(sub_window, FS)
+            for i in range(sub_intervals):
+                start_idx = i * sub_window_size
+                end_idx = (i + 1) * sub_window_size if i < sub_intervals - 1 else len(dphi_full)
                 
-                # 차원 맞춤: dphi를 FEATURE_DIM으로 조정
-                if len(dphi) >= FEATURE_DIM:
-                    # 다운샘플링으로 압축
-                    step = len(dphi) / FEATURE_DIM
-                    compressed = np.zeros(FEATURE_DIM, dtype=np.float32)
-                    for j in range(FEATURE_DIM):
-                        start_feat = int(j * step)
-                        end_feat = int((j + 1) * step)
-                        if end_feat > len(dphi):
-                            end_feat = len(dphi)
-                        if start_feat < end_feat:
-                            compressed[j] = np.mean(dphi[start_feat:end_feat])
-                    sub_features.append(compressed)
+                # 전체 위상미분에서 해당 구간 추출
+                dphi_segment = dphi_full[start_idx:end_idx]
+                
+                # 서브윈도우 프레임과 FEATURE_DIM이 같아야 함
+                if len(dphi_segment) == FEATURE_DIM:
+                    sub_features.append(dphi_segment.astype(np.float32))
                 else:
-                    # 제로패딩으로 차원 확장
-                    result = np.zeros(FEATURE_DIM, dtype=np.float32)
-                    result[:len(dphi)] = dphi
-                    sub_features.append(result)
-            except Exception as e:
-                print(f"에러 발생: {e}")
-                raise e
+                    print(f"위상미분 구간 크기 불일치: {len(dphi_segment)} != {FEATURE_DIM}")
+                    raise ValueError(f"위상미분 구간 크기 불일치: {len(dphi_segment)} != {FEATURE_DIM}")
+
+        except Exception as e:
+            print(f"위상미분 추출 중 에러 발생: {e}")
+            raise e
         
-        # # 16개 서브구간을 하나의 배열로 결합
-        # return np.array(sub_features, dtype=np.float32)  # shape: (16, FEATURE_DIM)
-         # (8, FEATURE_DIM)으로 결합
+        # (8, FEATURE_DIM)으로 결합
         feats = np.array(sub_features, dtype=np.float32)  # (8, 36)
         # 서브구간(행)별 z-score 정규화 제거: 크기/스케일 정보 보존
         return feats
-    
-
     
     def train_on_multiple_files(self, all_z_tau: List[np.ndarray], all_gt_times: List[np.ndarray], batch_size: int = 32):
         """여러 파일로 DataLoader 배치 학습 (검증 및 얼리 스탑 포함)"""
