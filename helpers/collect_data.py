@@ -133,14 +133,14 @@ def radar_thread():
             # === 품질 알림: 위상 일관성 C, HR-SNR(dB) 계산 ===
             z_tau = processed_data.get('z_tau', None)
             if z_tau is not None:
-                fs = int(round(1.0 / RADAR_CFG.frame_repetition_time_s)) or 36
+                fs = 1.0 / RADAR_CFG.frame_repetition_time_s
                 # 0.30 Hz HPF로 드리프트/호흡 억제 → HR 품질 평가
                 bhp, ahp = butter(2, 0.30/(fs/2), btype='highpass')
                 phi = np.unwrap(np.angle(z_tau)).astype(np.float32)
                 phi_d = filtfilt(bhp, ahp, phi)
                 C = float(np.abs(np.mean(np.exp(1j*phi_d))))
                 # Welch 기반 HR-SNR 계산 (HR: 0.8–3.0 Hz, Noise: 3.5–5.0 Hz)
-                nper = min(len(phi_d), 36*8)
+                nper = min(len(phi_d), int(fs*8))
                 nover = nper//2
                 f, Pxx = welch(phi_d, fs=fs, nperseg=nper, noverlap=nover)
                 hr_band = (f >= 0.8) & (f <= 3.0)
