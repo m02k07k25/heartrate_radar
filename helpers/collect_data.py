@@ -10,7 +10,7 @@ import numpy as np
 import serial
 
 from ifxradarsdk.fmcw import DeviceFmcw
-from ifxradarsdk.fmcw.types import FmcwSimpleSequenceConfig, FmcwSequenceChirp
+# from ifxradarsdk.fmcw.types import FmcwSimpleSequenceConfig, FmcwSequenceChirp
 from .preproc_signal import process_radar_data
 from .run_calibration import RADAR_CFG
 
@@ -26,7 +26,7 @@ ECG_BAUD = 1_000_000
 
 # ECG 피크 검출 파라미터
 THRESH_V = 1.65
-RESET_V  = 0.02
+RESET_V  = 0.1
 MIN_INTERVAL_MS = 300
 # ======================================================
 
@@ -49,6 +49,9 @@ ecg_ready   = threading.Event()
 start_event = threading.Event()
 stop_event  = threading.Event()    # 정상 종료(레이더 1560 프레임 완료)
 fatal_event = threading.Event()    # 어느 쪽이든 오류 발생 시
+
+# 공유 시작 시간 (시간축 동기화용)
+t_start = None
 
 def wait_for_start_or_fatal(poll_sec=0.01):
     # start_event가 켜질 때까지 대기하되, fatal이면 즉시 탈출
@@ -186,7 +189,7 @@ def ecg_thread():
             aborted = True
             return
 
-        t0 = time.perf_counter()
+        # 공유 시작 시간 사용 (시간축 동기화)
         with open(tmp_path, "w", newline="") as pf:
             w = csv.writer(pf)
             w.writerow(["t_s", "voltage"])
@@ -211,7 +214,7 @@ def ecg_thread():
                     continue
 
                 v0, v1 = float(parts[0]), float(parts[1])
-                t_s = time.perf_counter() - t0
+                t_s = time.perf_counter() - t_start
 
                 if armed and (v1 > THRESH_V) and ((t_s * 1000.0 - last_peak_ms) >= MIN_INTERVAL_MS):
                     w.writerow([f"{t_s:.3f}", f"{v1:.3f}"])
@@ -268,6 +271,7 @@ if __name__ == "__main__":
         if radar_ready.is_set() and ecg_ready.is_set():
             # 두 장치 모두 준비 완료 -> 동시에 시작
             print("[MAIN] 두 장치 준비 완료. 동시 시작!")
+            t_start = time.perf_counter()  # 공유 시작 시간 설정
             start_event.set()
             break
         if time.perf_counter() - t_wait0 > WAIT_SEC:
