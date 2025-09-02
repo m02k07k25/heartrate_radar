@@ -16,7 +16,7 @@ from helpers.preproc_lstm import (
     extract_phase_derivative,
 )
 from helpers.preproc_signal import range_axis_m
-from helpers.radar_config import FS_ADC, PAD_FT, B_HZ, NUM_SAMPLES
+from helpers.radar_config import FS_ADC, PAD_FT, B_HZ, NUM_SAMPLES, FRAME_REPETITION_TIME_S, FS_FRAME
 from typing import Tuple, List, Optional, Dict
 
 # ===== 학습 파라미터 =====
@@ -32,14 +32,13 @@ EARLY_STOP_MIN_DELTA = 1e-5   # 최소 개선 임계값 - 더 관대하게
 # ===== 스케줄러 파라미터 =====
 SCHEDULER_FACTOR = 0.5        # 학습률 감소 비율
 SCHEDULER_PATIENCE = 30       # 스케줄러 인내심 (에포크)
-SCHEDULER_MIN_LR = 1e-5       # 최소 학습률
+SCHEDULER_MIN_LR = 5e-6       # 최소 학습률
 
 # ===== 신호 처리 파라미터 =====
-FS          = 36.0            # 프레임레이트 (Hz)
+FS          = FS_FRAME        # 프레임레이트 (Hz) - radar_config에서 가져옴
 WIN_FRAMES  = int(8.0 * FS)   # 8초 윈도우 = 288 프레임
-HOP_FRAMES  = 18*2            # 1초 홉 18*2프레임
-# FMIN, FMAX  = 0.5, 3.33     # 심박 대역 [Hz] (30-200 BPM에 대응)
-# PAD_FACTOR  = 8             # FFT 패딩 (주파수 해상도 향상)
+HOP_FRAMES  = int(1.0 * FS)   # 1초 홉 = FS 프레임
+FMIN, FMAX  = 0.8, 3.0      # 심박 대역 [Hz] (48-180 BPM에 대응)
 FEATURE_DIM = 36              # 1D CNN으로 압축할 특징 차원
 
 # ===== 경로 설정 =====
@@ -133,7 +132,7 @@ def load_ground_truth(path: str) -> Optional[np.ndarray]:
                 continue
     return np.array(timestamps, dtype=np.float32) if timestamps else None
 
-def create_bpm_labels(gt_times, z_tau, window_sec=3.0):
+def create_bpm_labels(gt_times, z_tau, window_sec=8.0):
     """ECG 타임스탬프로부터 구간의 평균 BPM 라벨 생성
     
     IBI(Inter-Beat Interval) 기반으로 정확한 BPM 계산:
@@ -141,7 +140,7 @@ def create_bpm_labels(gt_times, z_tau, window_sec=3.0):
     """
     T = len(z_tau); labels = []
     for i in range(WIN_FRAMES, T, HOP_FRAMES):
-        t_end = i / FS; t_start = max(0.0, t_end - window_sec)
+        t_end = i * FRAME_REPETITION_TIME_S; t_start = max(0.0, t_end - window_sec)
         # 창 안 비트
         m = (gt_times >= t_start) & (gt_times < t_end)
         beats = gt_times[m]
@@ -149,9 +148,9 @@ def create_bpm_labels(gt_times, z_tau, window_sec=3.0):
         if len(beats) >= 2:
             ibi = np.diff(beats)          # 창 내부 IBI들
             bpm = 60.0 / float(np.mean(ibi))
-        elif len(beats) == 1:
+        elif len(beats) <= int(window_sec):
             # bpm = 0
-            raise ValueError("비트가 1개 이하입니다.")
+            raise ValueError(f"비트가 {int(window_sec)}개 이하입니다.")
         labels.append(bpm)  # 정규화 없이 직접 BPM 값 사용
     return np.array(labels, dtype=np.float32)
 
@@ -485,8 +484,8 @@ class BPMPredictor:
         
         # 8초 전체에 먼저 BPF 적용: 50 BPM 이상 (0.83 Hz 이상) 통과, 5차 필터 사용
         # 50 BPM = 0.83 Hz, 200 BPM = 3.33 Hz
-        low_freq = 0.8  # Hz (48 BPM)
-        high_freq = 3.0  # Hz (180 BPM)
+        low_freq = FMIN  # Hz (48 BPM)
+        high_freq = FMAX  # Hz (180 BPM)
         
         # 5차 Butterworth BPF 설계
         from scipy.signal import butter, filtfilt
