@@ -43,10 +43,10 @@ HOP_FRAMES  = 18*2            # 1초 홉 18*2프레임
 FEATURE_DIM = 36              # 1D CNN으로 압축할 특징 차원
 
 # ===== 경로 설정 =====
-TRAIN_DATA_DIR = "record2/train/data/"
-TRAIN_ANSWER_DIR = "record2/train/answer/"
-TEST_DATA_DIR = "record2/test/data/"
-TEST_ANSWER_DIR = "record2/test/answer/"
+TRAIN_DATA_DIR = "record3/train/data/"
+TRAIN_ANSWER_DIR = "record3/train/answer/"
+TEST_DATA_DIR = "record3/test/data/"
+TEST_ANSWER_DIR = "record3/test/answer/"
 
 # ===== 시드 고정 (재현성) =====
 seed = 42
@@ -195,7 +195,7 @@ def create_training_data(all_z_tau: List[np.ndarray], all_gt_times: List[np.ndar
     num_val_files = min(num_val_files, num_files)
     
     # 20개 단위 구간으로 나누어 각 구간에서 랜덤하게 선택 (1~20, 21~40, 41~60, ...)
-    bucket_size = 20
+    bucket_size = 5
     val_indices = []
     
     # 각 구간에서 선택할 개수 계산 (라운드로빈)
