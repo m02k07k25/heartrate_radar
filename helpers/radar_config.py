@@ -14,7 +14,7 @@ C_LIGHT = 299_792_458.0                    # 빛의 속도 [m/s]
 
 # ===== 레이더 하드웨어 설정 =====
 # FMCW 시퀀스 설정
-FRAME_REPETITION_TIME_S = 1.0/36           # 프레임 반복 시간 [s] (~36 Hz)
+FS_FRAME = 36.0                            # 프레임레이트 [Hz] (목표값)
 CHIRP_REPETITION_TIME_S = 434e-6           # Chirp 반복 시간 [s]
 NUM_CHIRPS = 64                            # 프레임당 Chirp 수
 TDM_MIMO = False                           # TDM MIMO 사용 여부
@@ -41,7 +41,7 @@ LAMBDA = C_LIGHT / F0_HZ                   # 파장 [m] (~4.93 mm)
 
 # 시간 관련
 FS_ADC = SAMPLE_RATE_HZ                    # ADC 샘플레이트 [Hz] (2 MHz)
-FS_FRAME = 1.0 / FRAME_REPETITION_TIME_S   # 프레임레이트 [Hz] (~36 Hz)
+FRAME_REPETITION_TIME_S = 1.0 / FS_FRAME   # 프레임 반복 시간 [s] (파생값)
 FRAME_HZ = FS_FRAME                         # 프레임레이트 별칭
 
 # 샘플링 관련

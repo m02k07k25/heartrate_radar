@@ -755,7 +755,7 @@ class BPMPredictor:
         }
     
     def evaluate_predictions(self, z_tau: np.ndarray, gt_times: np.ndarray) -> None:
-        """예측 성능을 구간별로 상세 평가 (현재 사용 안함)"""
+        """예측 성능을 구간별로 상세 평가"""
  
         pred_bpms, window_times = self.predict_bpm(z_tau)
         true_bpms = create_bpm_labels(gt_times, z_tau)
