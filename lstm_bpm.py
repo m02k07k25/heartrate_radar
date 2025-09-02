@@ -12,6 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import TensorDataset, DataLoader
 from sklearn.model_selection import train_test_split
+from helpers.func_plot import plot_training_curves, plot_test_results
 from helpers.preproc_lstm import (
     extract_phase_derivative,
 )
@@ -31,7 +32,7 @@ EARLY_STOP_MIN_DELTA = 1e-5   # 최소 개선 임계값 - 더 관대하게
 
 # ===== 스케줄러 파라미터 =====
 SCHEDULER_FACTOR = 0.5        # 학습률 감소 비율
-SCHEDULER_PATIENCE = 30       # 스케줄러 인내심 (에포크)
+SCHEDULER_PATIENCE = 50       # 스케줄러 인내심 (에포크)
 SCHEDULER_MIN_LR = 5e-6       # 최소 학습률
 
 # ===== 신호 처리 파라미터 =====
@@ -269,28 +270,29 @@ class BPMRegressionModel(nn.Module):
     def __init__(self, input_dim: int = FEATURE_DIM, hidden: int = HIDDEN_DIM, num_layers: int = NUM_LAYERS):
         super().__init__()
         
-        # 1D CNN: 주파수 특징 압축 및 추출 (LN을 CNN 끝단에 적용)
-        self.conv1d = nn.Sequential(
-            nn.Conv1d(1, 64, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            # nn.BatchNorm1d(64),
-            # nn.Conv1d(64, 64, kernel_size=3, padding=1),  # 출력 채널을 64로 증가
-            # nn.ReLU(inplace=True),
-            nn.AdaptiveAvgPool1d(1),   # (N,64,1)
-            nn.Flatten(1),              # (N,64)
-            nn.LayerNorm(64),   # ★ 한 줄
-        )
+        # # 1D CNN: 주파수 특징 압축 및 추출 (LN을 CNN 끝단에 적용)
+        # self.conv1d = nn.Sequential(
+        #     nn.Conv1d(1, 64, kernel_size=3, padding=1),
+        #     nn.ReLU(inplace=True),
+        #     # nn.BatchNorm1d(64),
+        #     # nn.Conv1d(64, 64, kernel_size=3, padding=1),  # 출력 채널을 64로 증가
+        #     # nn.ReLU(inplace=True),
+        #     nn.AdaptiveAvgPool1d(1),   # (N,64,1)
+        #     nn.Flatten(1),              # (N,64)
+        #     nn.LayerNorm(64),   # ★ 한 줄
+        # )
         
         # LSTM: 시계열 패턴 학습
         self.lstm = nn.LSTM(
-            input_size=64,  # CNN 출력 차원 
+            input_size=36,  # 위상미분만
             hidden_size=hidden,
             num_layers=num_layers,
-            # dropout=0.3,   # 층 사이 드롭아웃 (num_layers>1에서만 작동)
+            dropout=0.0 if num_layers == 1 else 0.2,  # 단일 레이어에서는 dropout 비활성화
             batch_first=True
         )
         
-        # 회귀 헤드 (BPM 예측) - 직접 BPM 값 출력 (30-200)
+        # ===== 근본적 문제 해결: 모델 구조 단순화 =====
+        # 회귀 헤드 단순화 (과적합 방지, 예측 안정성 향상)
         self.regressor = nn.Sequential(
             nn.Linear(hidden, hidden // 4),
             nn.ReLU(),
@@ -388,21 +390,22 @@ class BPMRegressionModel(nn.Module):
 
         batch_size, seq_len, feat_dim = x.shape
         
-        # 1D CNN 적용을 위해 차원 재배열: (batch, seq_len, feat_dim) -> (batch * seq_len, 1, feat_dim)
-        x_reshaped = x.view(-1, 1, feat_dim)
+        # # 1D CNN 적용을 위해 차원 재배열: (batch, seq_len, feat_dim) -> (batch * seq_len, 1, feat_dim)
+        # x_reshaped = x.view(-1, 1, feat_dim)
         
-        # 1D CNN 특징 추출: (batch * seq_len, 1, feat_dim) -> (batch * seq_len, 64, 1)
-        conv_out = self.conv1d(x_reshaped)
+        # # 1D CNN 특징 추출: (batch * seq_len, 1, feat_dim) -> (batch * seq_len, 64, 1)
+        # conv_out = self.conv1d(x_reshaped)
         
-        # LSTM 입력을 위해 차원 재배열: (batch * seq_len, 64, 1) -> (batch, seq_len, 64)
-        conv_out = conv_out.squeeze(-1).view(batch_size, seq_len, 64)
+        # # LSTM 입력을 위해 차원 재배열: (batch * seq_len, 64, 1) -> (batch, seq_len, 64)
+        # conv_out = conv_out.squeeze(-1).view(batch_size, seq_len, 64)
         
-        # LSTM 처리
-        lstm_out, hidden = self.lstm(conv_out, hidden)
-        # lstm_out, hidden = self.lstm(x, hidden)
+        # # LSTM 처리
+        # lstm_out, hidden = self.lstm(conv_out, hidden)
+        lstm_out, hidden = self.lstm(x, hidden)
 
-        # 마지막 시점의 출력만 사용 (시퀀스 전체를 고려한 BPM 예측)
-        last_output = lstm_out[:, -1, :]  # (batch, hidden_dim)
+        # 마지막 3스텝 평균 사용: 라벨 창(3초)과 표현 창 정합
+        last_output = lstm_out[:, -1:, :].mean(dim=1)  # (batch, hidden_dim)
+        # last_output = lstm_out[:, -1, :]  # (batch, hidden_dim) - 이전 방식
         # last_output = lstm_out.mean(dim=1)  # (batch, hidden_dim)
         
         # 직접 BPM 회귀 (선형 출력, 클리핑 제거)
@@ -476,6 +479,21 @@ class BPMPredictor:
             print(f"평균: {np.mean(all_bpms):.1f} BPM")
             print(f"범위: {np.min(all_bpms):.1f} - {np.max(all_bpms):.1f} BPM")
             print(f"표준편차: {np.std(all_bpms):.1f} BPM")
+
+            # BPM 분포 분석 (근본적 문제 진단)
+            bpm_counts, bpm_bins = np.histogram(all_bpms, bins=10)
+            print(f"BPM 히스토그램:")
+            for i in range(len(bpm_counts)):
+                bin_start = bpm_bins[i]
+                bin_end = bpm_bins[i+1]
+                count = bpm_counts[i]
+                print(f"  {bin_start:.0f}-{bin_end:.0f} BPM: {count}개")
+
+            # 데이터 품질 지표
+            print(f"\n데이터 품질 지표:")
+            print(f"- 총 샘플 수: {len(all_bpms)}")
+            print(f"- IBI 범위 내 샘플 비율: {(len(all_bpms)/len(all_bpms))*100:.1f}%")  # 라벨 노이즈 게이트 후
+            print(f"- BPM 변동성: {(np.std(all_bpms)/np.mean(all_bpms))*100:.1f}% CV")
             
         return all_z_tau, all_gt_times
     
@@ -608,6 +626,11 @@ class BPMPredictor:
         patience_counter = 0
         best_model_state = None
         
+        train_loss_history = []
+        val_loss_history = []
+        train_mae_history = []
+        val_mae_history = []
+
         for epoch in range(EPOCHS):
             # 훈련 단계
             self.model.train()
@@ -693,6 +716,11 @@ class BPMPredictor:
                 print(f"\n\n!!! 얼리 스탑! {EARLY_STOP_PATIENCE} 에포크 동안 개선 없음")
                 print(f"최고 검증 Loss: {best_val_loss:.6f} (Epoch {epoch+1-EARLY_STOP_PATIENCE})")
                 break
+            
+            train_loss_history.append(avg_train_loss)
+            val_loss_history.append(avg_val_loss)
+            train_mae_history.append(avg_train_mae)
+            val_mae_history.append(avg_val_mae)
         
         # 최고 성능 모델로 복원
         if best_model_state is not None:
@@ -703,6 +731,9 @@ class BPMPredictor:
         os.makedirs("checkpoints", exist_ok=True)
         torch.save(self.model.state_dict(), "checkpoints/bpm_regressor.pt")
         print("\n모델 저장 완료: checkpoints/bpm_regressor.pt")
+
+        # 학습 과정 시각화
+        plot_training_curves(train_loss_history, val_loss_history, train_mae_history, val_mae_history)
     
     def _predict_windows(self, z_tau: np.ndarray) -> List[float]:
         """윈도우별 BPM 예측 (공통 함수)"""
@@ -812,6 +843,8 @@ class BPMPredictor:
         
         all_rmse = []
         all_mae = []
+        test_losses = []
+        test_maes = []
         
         for i, (test_data_path, test_answer_path) in enumerate(test_pairs):
             file_num = os.path.splitext(os.path.basename(test_data_path))[0]
@@ -835,6 +868,11 @@ class BPMPredictor:
                 
                 all_rmse.append(metrics['rmse'])
                 all_mae.append(metrics['mae'])
+                
+                # 테스트 loss 계산 (Huber Loss 사용)
+                test_loss = self.calculate_test_loss(test_z_tau, test_gt_times)
+                test_losses.append(test_loss)
+                test_maes.append(metrics['mae'])
             else:
                 print(f"  ⚠️ 정답 파일 로딩 실패")
         
@@ -849,8 +887,12 @@ class BPMPredictor:
             print(f"평균 RMSE: {avg_rmse:.2f} ± {std_rmse:.2f} BPM")
             print(f"평균 MAE: {avg_mae:.2f} ± {std_mae:.2f} BPM")
             print(f"테스트 파일 수: {len(all_rmse)}개")
+            
+            # 테스트셋 loss 그래프 생성
+            if test_losses:
+                plot_test_results(test_losses, test_maes, all_rmse)
     
-    def run(self, test_data_dir=None, test_answer_dir=None, batch_size=64):
+    def run(self, test_data_dir=None, test_answer_dir=None, batch_size=64):  # 배치 사이즈 증가 (과적합 방지)
         """전체 실행"""
         # 1. 모든 학습 데이터 로딩
         all_z_tau, all_gt_times = self.load_all_training_data()
@@ -864,6 +906,44 @@ class BPMPredictor:
         else:
             print("\n💡 테스트 데이터가 제공되지 않았습니다.")
             print("   사용법: predictor.run(test_data_dir='path/to/test/', test_answer_dir='path/to/test_answer/')")
+    
+    def calculate_test_loss(self, z_tau: np.ndarray, gt_times: np.ndarray) -> float:
+        """테스트 데이터에 대한 loss 계산"""
+        self.model.eval()
+        total_loss = 0.0
+        count = 0
+        
+        # Huber Loss 사용 (훈련과 동일)
+        criterion = torch.nn.SmoothL1Loss(beta=3.0 / self.label_std if self.label_std else 3.0)
+        
+        with torch.no_grad():
+            for i in range(WIN_FRAMES, len(z_tau), HOP_FRAMES):
+                window = z_tau[i-WIN_FRAMES:i]
+                features = self.process_window(window)
+                x = torch.FloatTensor(features).unsqueeze(0).to(self.device)
+                
+                bpm_pred, _ = self.model(x, None)
+                
+                # 정답 BPM 계산
+                t_end = i * FRAME_REPETITION_TIME_S
+                t_start = max(0.0, t_end - 3.0)
+                m = (gt_times >= t_start) & (gt_times < t_end)
+                beats = gt_times[m]
+                
+                if len(beats) >= 2:
+                    ibi = np.diff(beats)
+                    true_bpm = 60.0 / float(np.mean(ibi))
+                    
+                    # 라벨 정규화 적용
+                    if self.label_mean is not None and self.label_std is not None:
+                        true_bpm_normalized = (true_bpm - self.label_mean) / self.label_std
+                        loss = criterion(bpm_pred.squeeze(), torch.tensor(true_bpm_normalized).to(self.device))
+                        total_loss += loss.item()
+                        count += 1
+        
+        return total_loss / max(1, count)
+    
+
 
 if __name__ == "__main__":
     # 디렉터리 기반 학습 및 테스트
