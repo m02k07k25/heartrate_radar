@@ -22,7 +22,7 @@ from typing import Tuple, List, Optional, Dict
 
 # ===== 학습 파라미터 =====
 EPOCHS = 1000                 # 에포크
-LEARNING_RATE = 1e-4  # 학습률 증가로 다양성 향상          # 직접 BPM 예측용 낮은 학습률 (과적합 방지)
+LEARNING_RATE = 5e-4  # 학습률 증가로 다양성 향상          # 직접 BPM 예측용 낮은 학습률 (과적합 방지)
 HIDDEN_DIM = 128
 NUM_LAYERS = 2                # LSTM 레이어 2층 및 드롭아웃 적용
 
@@ -43,7 +43,7 @@ FMIN, FMAX  = 0.8, 3.0      # 심박 대역 [Hz] (48-180 BPM에 대응) - BPF �
 FEATURE_DIM = 18              # 1D CNN으로 압축할 특징 차원 -> 홉수
 
 # ===== 부드러움 제약 파라미터 =====
-SMOOTH_LAMBDA = 0.003           # 부드러움 제약 강도 더 증가 (데이터 손실의 5-10% 수준으로)
+SMOOTH_LAMBDA = 0.01           # 부드러움 제약 강도 더 증가 (데이터 손실의 5-10% 수준으로)
 
 # ===== 경로 설정 =====
 TRAIN_DATA_DIR = "record3/train/data/"
@@ -629,9 +629,9 @@ class BPMPredictor:
         beta_bpm = 3.0                             # 2~4 BPM 중 하나로 튜닝
         beta_std = beta_bpm / self.label_std        # z-스케일 임계치
         
-        criterion = torch.nn.SmoothL1Loss(beta=beta_std, reduction='none')  # 학습/검증/테스트 모두 동일
+        # criterion 객체는 더 이상 사용하지 않음 (F.smooth_l1_loss 직접 호출)
         print(f"Huber Loss beta 조정: {beta_bpm} BPM -> {beta_std:.3f} (z-scale)")
-        # criterion = torch.nn.SmoothL1Loss(beta=4.0)  # Huber loss
+        print(f"SmoothL1Loss 직접 호출로 브로드캐스트 경고 제거")
         
         # 학습률 스케줄러 추가 (검증 손실 기반)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -710,11 +710,12 @@ class BPMPredictor:
                 pred = bpm_pred.squeeze()
                 labels_squeezed = labels.squeeze()
 
-                # 차원 일치 보장 (간단화: view(-1)로 1D 텐서 통일)
-                # criterion이 reduction='none'이므로 개별 샘플 loss를 반환
-                pred_flat = pred.view(-1)
-                labels_flat = labels_squeezed.view(-1)
-                base = criterion(pred_flat, labels_flat)  # (B,) 형태의 개별 샘플 loss
+                # 차원 일치 보장 (브로드캐스트 경고 제거)
+                pred_flat = pred.view(-1)        # (B,)
+                labels_flat = labels_squeezed.view(-1)    # (B,)
+                
+                # SmoothL1Loss 직접 호출로 브로드캐스트 경고 제거
+                base = F.smooth_l1_loss(pred_flat, labels_flat, reduction='none', beta=beta_std)  # (B,) 형태의 개별 샘플 loss
 
                 # SNR 기반 가중치 계산 (채널 3: SNR_hr)
                 snr = features[:, :, 3, :].mean(dim=(1,2))  # (B,) - 배치별 평균 SNR
@@ -849,18 +850,15 @@ class BPMPredictor:
                     pred_val = bpm_pred.squeeze()  # 예측값
                     labels_val = labels.squeeze()  # 라벨
 
-                    # 차원 일치 보장 (간단화: view(-1)로 1D 텐서 통일)
-                    # criterion이 reduction='none'이므로 개별 샘플 loss를 반환
-                    pred_val_flat = pred_val.view(-1)
-                    labels_val_flat = labels_val.view(-1)
-                    base_loss = criterion(pred_val_flat, labels_val_flat)  # (B,) 형태의 개별 샘플 loss
+                    # 차원 일치 보장 (브로드캐스트 경고 제거)
+                    pred_val_flat = pred_val.view(-1)        # (B,)
+                    labels_val_flat = labels_val.view(-1)    # (B,)
+                    
+                    # SmoothL1Loss 직접 호출로 브로드캐스트 경고 제거
+                    base_loss = F.smooth_l1_loss(pred_val_flat, labels_val_flat, reduction='mean', beta=beta_std)  # 스칼라 손실
 
                     # 최종 검증 손실 (부드러움 제약 제외)
-                    # base_loss가 벡터인 경우 평균 계산 (reduction='none' 때문)
-                    if base_loss.numel() > 1:
-                        loss = base_loss.mean()
-                    else:
-                        loss = base_loss.item() if hasattr(base_loss, 'item') else base_loss
+                    loss = base_loss
 
                     # 디버깅: 검증 단계 순수 데이터 손실 출력 (첫 배치만)
                     if batch_count == 0:
@@ -967,9 +965,20 @@ class BPMPredictor:
         pred_array = np.array(pred_bpms[:min_len])
         true_array = np.array(true_bpms[:min_len])
         
+        # 훈련/검증과 동일한 방식으로 MAE 계산 (PyTorch F.l1_loss 사용)
+        pred_tensor = torch.tensor(pred_array, dtype=torch.float32)
+        true_tensor = torch.tensor(true_array, dtype=torch.float32)
+        
+        # 차원 일치 보장 (브로드캐스트 경고 제거)
+        pred_flat = pred_tensor.view(-1)        # (N,)
+        true_flat = true_tensor.view(-1)        # (N,)
+        
+        # F.l1_loss로 MAE 계산 (훈련/검증과 동일)
+        mae_tensor = F.l1_loss(pred_flat, true_flat, reduction='mean')
+        
         return {
             "rmse": float(np.sqrt(np.mean((pred_array - true_array) ** 2))),
-            "mae": float(np.mean(np.abs(pred_array - true_array))),
+            "mae": float(mae_tensor.item()),  # PyTorch F.l1_loss 사용
             "avg_pred_bpm": float(np.mean(pred_array)),
             "avg_true_bpm": float(np.mean(true_array))
         }
@@ -1004,11 +1013,19 @@ class BPMPredictor:
             if len(interval_pred) == 0:
                 continue
                 
-            # 구간 내 통계
+            # 구간 내 통계 (훈련/검증과 동일한 방식으로 MAE 계산)
             pred_mean = float(np.mean(interval_pred))
             true_mean = float(np.mean(interval_true))
             pred_std = float(np.std(interval_pred))
             true_std = float(np.std(interval_true))
+            
+            # PyTorch F.l1_loss로 MAE 계산 (훈련/검증과 동일)
+            pred_tensor = torch.tensor(interval_pred, dtype=torch.float32)
+            true_tensor = torch.tensor(interval_true, dtype=torch.float32)
+            pred_flat = pred_tensor.view(-1)
+            true_flat = true_tensor.view(-1)
+            mae = float(F.l1_loss(pred_flat, true_flat, reduction='mean').item())
+            
             rmse = float(np.sqrt(np.mean((np.array(interval_pred) - np.array(interval_true))**2)))
             
             start_time = float(interval_times[0])
@@ -1017,8 +1034,8 @@ class BPMPredictor:
             if end_idx == len(pred_bpms):
                 end_time = min(end_time + step_seconds, total_duration)
             
-            # 한 줄 요약 출력 
-            print(f"구간 {start_time:.1f}~{end_time:.1f}초 | 예측 {pred_mean:.2f}±{pred_std:.2f} | 실제 {true_mean:.2f}±{true_std:.2f} | RMSE {rmse:.2f} BPM")
+            # 한 줄 요약 출력 (MAE 추가)
+            print(f"구간 {start_time:.1f}~{end_time:.1f}초 | 예측 {pred_mean:.2f}±{pred_std:.2f} | 실제 {true_mean:.2f}±{true_std:.2f} | RMSE {rmse:.2f} BPM | MAE {mae:.2f} BPM")
             # print()
     
     def test_on_multiple_files(self, test_data_dir: str, test_answer_dir: str):
@@ -1105,7 +1122,7 @@ class BPMPredictor:
         
         # Huber Loss 사용 (훈련과 동일한 beta, 개별 샘플 loss)
         beta_std = 3.0 / self.label_std if self.label_std else 3.0
-        criterion = torch.nn.SmoothL1Loss(beta=beta_std, reduction='none')
+        # criterion 객체는 더 이상 사용하지 않음 (F.smooth_l1_loss 직접 호출)
         
         with torch.no_grad():
             for i in range(WIN_FRAMES, len(z_tau), HOP_FRAMES):
@@ -1128,7 +1145,13 @@ class BPMPredictor:
                     # 라벨 정규화 적용
                     if self.label_mean is not None and self.label_std is not None:
                         true_bpm_normalized = (true_bpm - self.label_mean) / self.label_std
-                        loss = criterion(bpm_pred.squeeze(), torch.tensor(true_bpm_normalized).to(self.device).unsqueeze(0))
+                        
+                        # 차원 일치 보장 (브로드캐스트 경고 제거)
+                        pred_flat = bpm_pred.squeeze().view(-1)        # (1,)
+                        target_flat = torch.tensor(true_bpm_normalized).to(self.device).view(-1)    # (1,)
+                        
+                        # SmoothL1Loss 직접 호출로 브로드캐스트 경고 제거
+                        loss = F.smooth_l1_loss(pred_flat, target_flat, reduction='mean', beta=beta_std)
                         total_loss += loss.item()
                         count += 1
         
