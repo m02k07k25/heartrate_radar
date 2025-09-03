@@ -22,25 +22,25 @@ from typing import Tuple, List, Optional, Dict
 
 # ===== 학습 파라미터 =====
 EPOCHS = 1000                 # 에포크
-LEARNING_RATE = 1e-4          # 직접 BPM 예측용 낮은 학습률
-HIDDEN_DIM = 256
-NUM_LAYERS = 1                # LSTM 레이어 2층 및 드롭아웃 적용
+LEARNING_RATE = 5e-5          # 직접 BPM 예측용 낮은 학습률 (과적합 방지)
+HIDDEN_DIM = 128
+NUM_LAYERS = 2                # LSTM 레이어 2층 및 드롭아웃 적용
 
 VALIDATION_SPLIT = 0.25       # 검증 데이터 비율 (20%로 줄임)
-EARLY_STOP_PATIENCE = 100     # 얼리 스탑 인내심 (에포크) - 더 여유롭게
-EARLY_STOP_MIN_DELTA = 1e-5   # 최소 개선 임계값 - 더 관대하게
+EARLY_STOP_PATIENCE = 200     # 얼리 스탑 인내심 (에포크) - 더 여유롭게
+EARLY_STOP_MIN_DELTA = 5e-5   # 최소 개선 임계값 - 더 관대하게
 
 # ===== 스케줄러 파라미터 =====
 SCHEDULER_FACTOR = 0.5        # 학습률 감소 비율
-SCHEDULER_PATIENCE = 50       # 스케줄러 인내심 (에포크)
+SCHEDULER_PATIENCE = 25       # 스케줄러 인내심 (에포크) - 더 빠른 학습률 감소
 SCHEDULER_MIN_LR = 5e-6       # 최소 학습률
 
 # ===== 신호 처리 파라미터 =====
 FS          = FS_FRAME        # 프레임레이트 (Hz) - radar_config에서 가져옴
 WIN_FRAMES  = int(8.0 * FS)   # 8초 윈도우 = 288 프레임
-HOP_FRAMES  = int(1.0 * FS)   # 1초 홉 = FS 프레임
-FMIN, FMAX  = 0.8, 3.0      # 심박 대역 [Hz] (48-180 BPM에 대응)
-FEATURE_DIM = 36              # 1D CNN으로 압축할 특징 차원
+HOP_FRAMES  = int(0.5 * FS)   # 0.5초 홉 = FS/2 프레임
+FMIN, FMAX  = 0.8, 3.0      # 심박 대역 [Hz] (48-180 BPM에 대응) - BPF 적용
+FEATURE_DIM = 18              # 1D CNN으로 압축할 특징 차원 -> 홉수
 
 # ===== 경로 설정 =====
 TRAIN_DATA_DIR = "record3/train/data/"
@@ -64,204 +64,11 @@ except Exception:
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
-# ===== 파일 처리 함수들 =====
-
-def calculation(file_path: str) -> Tuple[int, np.ndarray]:
-    """레이더 데이터에서 최적 거리 bin과 위상 신호 추출 (전처리된 데이터 또는 원본 데이터 모두 지원)"""
-    data = np.load(file_path, allow_pickle=True)
-    
-    # 새로운 전처리된 데이터 형식인지 확인
-    if isinstance(data, np.ndarray) and data.ndim == 0 and isinstance(data.item(), dict):
-        # 전처리된 데이터 (딕셔너리 형태)
-        processed_dict = data.item()
-        fc_bin = processed_dict['fc_bin']
-        z_tau = processed_dict['z_tau']
-        
-        # 거리 축 계산 후 fc_bin의 거리[m] 표기
-        rng_axis, _, _ = range_axis_m(FS_ADC, NUM_SAMPLES, PAD_FT, B_HZ)
-        dist_m = float(rng_axis[int(fc_bin)]) if 0 <= int(fc_bin) < len(rng_axis) else float('nan')
-        print(f"[CALCULATION] 전처리된 데이터 로드: fc_bin={fc_bin} ({dist_m:.2f} m)")
-        
-        return int(fc_bin), z_tau
-    raise ValueError(f"지원하지 않는 데이터 형식: type={type(data)}, shape={getattr(data, 'shape', 'N/A')}")
-
-def find_matching_files(data_dir: str, answer_dir: str) -> List[Tuple[str, str]]:
-    """폴더에서 매칭되는 데이터-정답 파일 쌍을 찾기"""
-    if not os.path.exists(data_dir) or not os.path.exists(answer_dir):
-        return []
-    
-    data_files = [f for f in os.listdir(data_dir) if f.endswith('.npy')]
-    answer_files = [f for f in os.listdir(answer_dir) if f.endswith('.csv')]
-    
-    # 번호로 매칭
-    pairs = []
-    for data_file in data_files:
-        # 파일명에서 번호 추출 (예: "5.npy" -> "5")
-        try:
-            data_num = os.path.splitext(data_file)[0]
-            answer_file = f"{data_num}.csv"
-            
-            if answer_file in answer_files:
-                data_path = os.path.join(data_dir, data_file)
-                answer_path = os.path.join(answer_dir, answer_file)
-                pairs.append((data_path, answer_path))
-        except Exception:
-            continue
-    
-    # 번호순으로 정렬
-    pairs.sort(key=lambda x: int(os.path.splitext(os.path.basename(x[0]))[0]))
-    return pairs
-
-def load_ground_truth(path: str) -> Optional[np.ndarray]:
-    """ECG 정답 파일 로드 (CSV 형식)"""
-    if not os.path.exists(path):
-        return None
-    timestamps: List[float] = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            # CSV 헤더 건너뛰기
-            if line.startswith("t_s"):
-                continue
-            # 쉼표로 구분
-            parts = line.split(",")
-            try:
-                timestamps.append(float(parts[0]))  # 첫 번째 열이 타임스탬프
-            except (ValueError, IndexError):
-                continue
-    return np.array(timestamps, dtype=np.float32) if timestamps else None
-
-def create_bpm_labels(gt_times, z_tau, window_sec=8.0):
-    """ECG 타임스탬프로부터 구간의 평균 BPM 라벨 생성
-    
-    IBI(Inter-Beat Interval) 기반으로 정확한 BPM 계산:
-    - 구간 내 비트 2개 이상: IBI 평균으로 BPM 계산 (60 / mean_IBI)
-    """
-    T = len(z_tau); labels = []
-    for i in range(WIN_FRAMES, T, HOP_FRAMES):
-        t_end = i * FRAME_REPETITION_TIME_S; t_start = max(0.0, t_end - window_sec)
-        # 창 안 비트
-        m = (gt_times >= t_start) & (gt_times < t_end)
-        beats = gt_times[m]
-        bpm = 60.0
-        if len(beats) >= 2:
-            ibi = np.diff(beats)          # 창 내부 IBI들
-            bpm = 60.0 / float(np.mean(ibi))
-        elif len(beats) <= int(window_sec):
-            # bpm = 0
-            raise ValueError(f"비트가 {int(window_sec)}개 이하입니다.")
-        labels.append(bpm)  # 정규화 없이 직접 BPM 값 사용
-    return np.array(labels, dtype=np.float32)
-
-# ===== 데이터 생성 함수 =====
-def create_training_data(all_z_tau: List[np.ndarray], all_gt_times: List[np.ndarray], predictor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """모든 파일에서 학습/검증 데이터 생성 (파일 단위 분할)"""
-    print("학습 데이터 생성 중...")
-    
-    # 파일별로 특징과 라벨 수집
-    file_features = []
-    file_labels = []
-    
-    for z_tau, gt_times in zip(all_z_tau, all_gt_times):
-        bpm_labels = create_bpm_labels(gt_times, z_tau)
-        file_feature_list = []
-        file_label_list = []
-        window_idx = 0
-        
-        for i in range(WIN_FRAMES, len(z_tau), HOP_FRAMES):
-            if window_idx >= len(bpm_labels):
-                break
-                
-            window = z_tau[i-WIN_FRAMES:i]
-            # 기존의 process_window 메서드 재사용
-            window_features = predictor.process_window(window)
-            
-            file_feature_list.append(window_features)
-            file_label_list.append(bpm_labels[window_idx])
-            window_idx += 1
-        
-        # 파일별로 특징과 라벨 저장
-        if file_feature_list:  # 빈 파일이 아닌 경우만
-            file_features.append(np.array(file_feature_list, dtype=np.float32))
-            file_labels.append(np.array(file_label_list, dtype=np.float32))
-    
-    print(f"데이터 생성 완료: {len(file_features)}개 파일")
-    
-    # 구간마다 골고루 랜덤 선택으로 검증 데이터 분할
-    num_files = len(file_features)
-    num_val_files = max(1, int(round(num_files * VALIDATION_SPLIT)))
-    num_val_files = min(num_val_files, num_files)
-    
-    # 20개 단위 구간으로 나누어 각 구간에서 랜덤하게 선택 (1~20, 21~40, 41~60, ...)
-    bucket_size = 5
-    val_indices = []
-    
-    # 각 구간에서 선택할 개수 계산 (라운드로빈)
-    num_buckets = (num_files + bucket_size - 1) // bucket_size  # 올림 계산
-    selections_per_bucket = [0] * num_buckets
-    
-    # 필요한 검증 파일 수를 구간에 골고루 분배
-    for i in range(num_val_files):
-        bucket_idx = i % num_buckets
-        selections_per_bucket[bucket_idx] += 1
-    
-    # 각 구간에서 랜덤하게 선택
-    rng = np.random.default_rng(42)  # 재현성을 위해 별도의 Generator 사용
-    for bucket_idx in range(num_buckets):
-        start_idx = bucket_idx * bucket_size
-        end_idx = min(start_idx + bucket_size, num_files)
-        bucket_files = list(range(start_idx, end_idx))
-        
-        # 이 구간에서 선택할 개수만큼 랜덤 샘플링
-        num_selections = selections_per_bucket[bucket_idx]
-        if num_selections > 0 and len(bucket_files) > 0:
-            selected = rng.choice(bucket_files,
-                                      size=min(num_selections, len(bucket_files)), 
-                                      replace=False)
-            val_indices.extend(selected)
-    
-    # 훈련 인덱스는 검증 인덱스를 제외한 나머지
-    train_indices = [i for i in range(num_files) if i not in set(val_indices)]
-    
-    # 훈련 데이터 결합
-    train_features = []
-    train_labels = []
-    for idx in train_indices:
-        train_features.extend(file_features[idx])
-        train_labels.extend(file_labels[idx])
-    
-    # 검증 데이터 결합
-    val_features = []
-    val_labels = []
-    for idx in val_indices:
-        val_features.extend(file_features[idx])
-        val_labels.extend(file_labels[idx])
-    
-    # numpy 배열로 변환
-    X_train = np.array(train_features, dtype=np.float32)
-    y_train = np.array(train_labels, dtype=np.float32)
-    X_val = np.array(val_features, dtype=np.float32)
-    y_val = np.array(val_labels, dtype=np.float32)
-
-    # 라벨 정규화 통계 (훈련 세트 기준)
-    predictor.label_mean = float(np.mean(y_train)) if len(y_train) > 0 else 0.0
-    predictor.label_std = float(np.std(y_train) + 1e-6) if len(y_train) > 0 else 1.0
-    print(f"라벨 정규화 통계: mean={predictor.label_mean:.2f}, std={predictor.label_std:.2f}")
-
-    # 라벨 표준화
-    if predictor.label_std > 0:
-        y_train = (y_train - predictor.label_mean) / predictor.label_std
-        y_val = (y_val - predictor.label_mean) / predictor.label_std
-    
-    print(f"파일 단위 데이터 분할 완료 (구간별 골고루 랜덤 샘플링):")
-    print(f"  검증 파일 인덱스: {sorted(val_indices)}")
-    print(f"  훈련 파일: {len(train_indices)}개, 윈도우: {len(X_train)}개")
-    print(f"  검증 파일: {len(val_indices)}개, 윈도우: {len(X_val)}개")
-    
-    return (torch.from_numpy(X_train), torch.from_numpy(y_train), 
-            torch.from_numpy(X_val), torch.from_numpy(y_val))
+# ===== 데이터 처리 함수들 (preproc_lstm.py에서 import) =====
+from helpers.preproc_lstm import (
+    calculation, find_matching_files, load_ground_truth, 
+    create_bpm_labels, create_training_data
+)
 
 # ===== 1D CNN + LSTM BPM 회귀 모델 정의 =====
 class BPMRegressionModel(nn.Module):
@@ -270,24 +77,21 @@ class BPMRegressionModel(nn.Module):
     def __init__(self, input_dim: int = FEATURE_DIM, hidden: int = HIDDEN_DIM, num_layers: int = NUM_LAYERS):
         super().__init__()
         
-        # # 1D CNN: 주파수 특징 압축 및 추출 (LN을 CNN 끝단에 적용)
-        # self.conv1d = nn.Sequential(
-        #     nn.Conv1d(1, 64, kernel_size=3, padding=1),
-        #     nn.ReLU(inplace=True),
-        #     # nn.BatchNorm1d(64),
-        #     # nn.Conv1d(64, 64, kernel_size=3, padding=1),  # 출력 채널을 64로 증가
-        #     # nn.ReLU(inplace=True),
-        #     nn.AdaptiveAvgPool1d(1),   # (N,64,1)
-        #     nn.Flatten(1),              # (N,64)
-        #     nn.LayerNorm(64),   # ★ 한 줄
-        # )
+        # 1D CNN: 7채널 입력 (다양한 관점의 신호)
+        self.conv1d = nn.Sequential(
+                nn.Conv1d(7, 64, kernel_size=3, padding=1),  # 7채널: dφ_BPF, dφ, H2_top1, SNR_hr, E_lo_norm, |z|_HPF, PSD_conf
+                nn.ReLU(inplace=True),
+                nn.AdaptiveAvgPool1d(1),   # (N,64,1)
+                nn.Flatten(1),              # (N,64)
+                nn.LayerNorm(64),   # ★ 한 줄
+            )
         
         # LSTM: 시계열 패턴 학습
         self.lstm = nn.LSTM(
-            input_size=36,  # 위상미분만
+            input_size=64,  # 위상미분만
             hidden_size=hidden,
             num_layers=num_layers,
-            dropout=0.0 if num_layers == 1 else 0.2,  # 단일 레이어에서는 dropout 비활성화
+            dropout=0.0 if num_layers == 1 else 0.3,  # 단일 레이어에서는 dropout 비활성화
             batch_first=True
         )
         
@@ -313,7 +117,8 @@ class BPMRegressionModel(nn.Module):
         
         # 모델 구조 출력
         print(f"BPM 회귀 모델 구조:")
-        print(f"  1D CNN: {input_dim} -> 64")
+        print(f"  1D CNN: 7채널({input_dim}) -> 64 (Conv1d 1개)")
+        print(f"    채널: [dφ_BPF, dφ, H2_top1, SNR_hr, E_lo_norm, |z|_HPF, PSD_conf]")
         print(f"  LSTM: 64 -> {hidden} (layers={num_layers})")
         print(f"  Regressor: {hidden} -> 1 (직접 BPM 출력)")
         
@@ -359,25 +164,22 @@ class BPMRegressionModel(nn.Module):
                             if 30 <= bpm <= 200:  # 유효한 BPM 범위
                                 all_bpms.append(bpm)
                 except Exception as e:
-                    print(f"[WARNING] {answer_file} 처리 중 오류: {e}")
-                    continue
+                    raise e
             
             if all_bpms:
                 mean_bpm = np.mean(all_bpms)
                 print(f"[INFO] 훈련 라벨 평균 계산 완료: {len(all_bpms)}개 파일, 평균 BPM: {mean_bpm:.2f}")
                 return float(mean_bpm)
             else:
-                print("[WARNING] 유효한 BPM 데이터를 찾을 수 없습니다. 기본값 80.0 사용")
-                return 80.0
+                raise ValueError("유효한 BPM 데이터를 찾을 수 없습니다.")
                 
         except Exception as e:
-            print(f"[WARNING] 훈련 라벨 평균 계산 중 오류: {e}. 기본값 80.0 사용")
-            return 80.0
-        
+            raise e
+
     def forward(self, x: torch.Tensor, hidden: Optional[Tuple] = None) -> Tuple[torch.Tensor, Tuple]:
         """
         Args:
-            x: (batch, seq_len, feat_dim)
+            x: (batch, seq_len, 7, feat_dim) - 7채널: [dφ_BPF, dφ, H2_top1, SNR_hr, E_lo_norm, |z|_HPF, PSD_conf]
             hidden: LSTM hidden state
         Returns:
             bpm_pred: (batch, 1) - 예측된 BPM 값
@@ -388,31 +190,33 @@ class BPMRegressionModel(nn.Module):
         # std = x.std(dim=1, keepdim=True) + 1e-6           # (B, 1, F)
         # x = (x - mu) / std                                # (B, T, F)
 
-        batch_size, seq_len, feat_dim = x.shape
+        batch_size, seq_len, channels, feat_dim = x.shape  # (batch, seq_len, 6, feat_dim)
         
-        # # 1D CNN 적용을 위해 차원 재배열: (batch, seq_len, feat_dim) -> (batch * seq_len, 1, feat_dim)
-        # x_reshaped = x.view(-1, 1, feat_dim)
+        # 1D CNN 적용을 위해 차원 재배열: (batch, seq_len, 6, feat_dim) -> (batch * seq_len, 6, feat_dim)
+        x_reshaped = x.view(-1, channels, feat_dim)
+        # 1D CNN 특징 추출: (batch * seq_len, 6, feat_dim) -> (batch * seq_len, 64, 1)
+        conv_out = self.conv1d(x_reshaped)
+        # LSTM 입력을 위해 차원 재배열: (batch * seq_len, 64, 1) -> (batch, seq_len, 64)
+        conv_out = conv_out.view(batch_size, seq_len, 64)
         
-        # # 1D CNN 특징 추출: (batch * seq_len, 1, feat_dim) -> (batch * seq_len, 64, 1)
-        # conv_out = self.conv1d(x_reshaped)
-        
-        # # LSTM 입력을 위해 차원 재배열: (batch * seq_len, 64, 1) -> (batch, seq_len, 64)
-        # conv_out = conv_out.squeeze(-1).view(batch_size, seq_len, 64)
-        
-        # # LSTM 처리
-        # lstm_out, hidden = self.lstm(conv_out, hidden)
-        lstm_out, hidden = self.lstm(x, hidden)
+        # LSTM 처리
+        lstm_out, hidden = self.lstm(conv_out, hidden)
 
-        # 마지막 3스텝 평균 사용: 라벨 창(3초)과 표현 창 정합
-        last_output = lstm_out[:, -1:, :].mean(dim=1)  # (batch, hidden_dim)
-        # last_output = lstm_out[:, -1, :]  # (batch, hidden_dim) - 이전 방식
-        # last_output = lstm_out.mean(dim=1)  # (batch, hidden_dim)
+        # 가중 평균 (권장, 라벨과 정확히 일치)
+        step_sec = HOP_FRAMES / FS                    # 0.5s
+        M = max(1, int(round(3.0 / step_sec)))        # 라벨 창 3.0초에 해당하는 0.5초에 해당하는 스텝 수 (Hop=0.5s → 6)
+        M = min(M, lstm_out.size(1))
+
+        sel = lstm_out[:, -M:, :]                     # (B, M, H)
+        # 뒤로 갈수록(라벨 끝에 가까울수록) 조금 더 가중
+        weights = torch.arange(1, M + 1, device=lstm_out.device, dtype=lstm_out.dtype)
+        weights = weights / weights.sum()
+        last_output = (sel * weights.view(1, M, 1)).sum(dim=1)  # (B, H)
+        # w = torch.tensor([0.2, 0.3, 0.5], device=lstm_out.device)
+        # last_output = (lstm_out[:, -3:, :] * w.view(1, 3, 1)).sum(dim=1)
         
         # 직접 BPM 회귀 (선형 출력, 클리핑 제거)
         bpm_pred = self.regressor(last_output)  # (batch, 1)
-        
-        # 클리핑을 제거하여 모델이 자유롭게 학습하도록 함
-        # 손실 계산에서만 범위 제한 적용
         
         return bpm_pred, hidden
 
@@ -436,7 +240,164 @@ class BPMPredictor:
         print(f"디바이스: {self.device}")
         print(f"학습 데이터 경로: {train_data_dir}")
         print(f"학습 정답 경로: {train_answer_dir}")
-        
+
+    def _apply_pre_filtering(self, signal_for_psd: np.ndarray, signal_for_notch: np.ndarray, fs: float) -> np.ndarray:
+        """프리필터링: 이상치 주파수 notch 제거 (안정성 개선 버전)
+
+        Args:
+            signal_for_psd: HPF만 적용한 dφ 신호 (PSD 검출용)
+            signal_for_notch: BPF 적용된 dφ 신호 (notch 적용용)
+            fs: 샘플링 주파수
+
+        Welch PSD로 HR 대역 이상치 탐지 후 선택적 notch 적용:
+        - 4초 세그먼트, 75% overlap (해상도 0.25Hz)
+        - 로컬 median 대비 z-score > 6.0 (보수적)
+        - 연속 2개 이상 지속되는 이상치만 선택
+        - 최강 HR 피크 1개 주변 ±0.20Hz 보호 (정교)
+        - 최대 1개 주파수에 notch (Q=30, 효과적이면 2개까지)
+        """
+        try:
+            from scipy.signal import welch, iirnotch, tf2sos, sosfiltfilt
+            from scipy.ndimage import median_filter
+
+            # Welch PSD 계산 (4초 세그먼트, 75% overlap, 해상도 0.25Hz)
+            nperseg = min(int(4.0 * fs), len(signal_for_psd))  # 4초 세그먼트 (안전하게 길이 제한)
+            noverlap = int(0.75 * nperseg)  # 75% overlap
+
+            f, Pxx = welch(signal_for_psd, fs=fs, window='hann',
+                          nperseg=nperseg, noverlap=noverlap,
+                          detrend='constant', scaling='density')
+
+            # HR 대역 추출 (0.8-3 Hz)
+            hr_mask = (f >= 0.8) & (f <= 3.0)
+            f_hr = f[hr_mask]
+            P_hr = Pxx[hr_mask]
+
+            if len(P_hr) == 0:\
+                raise ValueError("HR 대역 데이터 없음")
+
+            # 이상치 탐지 (로컬 median 대비 z-score/MAD)
+            bg = median_filter(P_hr, size=min(5, len(P_hr)), mode='nearest')
+            mad = np.median(np.abs(P_hr - bg)) + 1e-9
+            z_scores = (P_hr - bg) / mad
+
+            # 이상치 조건: z-score > 6.0, 연속 2개 이상 (보수적)
+            outlier_mask = z_scores > 6.0
+
+            # 연속성 체크 (2개 이상 연속)
+            consecutive_count = 0
+            sustained_outliers = []
+
+            for i, is_outlier in enumerate(outlier_mask):
+                if is_outlier:
+                    consecutive_count += 1
+                else:
+                    if consecutive_count >= 2:  # 2개 이상 연속
+                        sustained_outliers.extend(range(i - consecutive_count, i))
+                    consecutive_count = 0
+
+            # 마지막 그룹 처리
+            if consecutive_count >= 2:
+                sustained_outliers.extend(range(len(outlier_mask) - consecutive_count, len(outlier_mask)))
+
+            # 중복 제거 및 정렬
+            sustained_outliers = sorted(list(set(sustained_outliers)))
+
+            # 피크 보호: 최강 HR 피크 1개 주변 ±0.20Hz 보호 (정교)
+            protect_mask = np.zeros(len(f_hr), dtype=bool)
+            if len(P_hr) > 0:
+                # 최강 피크 1개만 보호 (가장 큰 1개)
+                peak_idx = np.argmax(P_hr)
+                peak_freq = f_hr[peak_idx]
+                # 피크 주변 ±0.20 Hz 보호
+                peak_protect = (f_hr >= peak_freq - 0.20) & (f_hr <= peak_freq + 0.20)
+                protect_mask |= peak_protect
+
+            # 보호 구간 제외
+            sustained_outliers = [idx for idx in sustained_outliers if not protect_mask[idx]]
+
+            # 개수 제한: 최대 1개 notch (효과적이면 2개까지 허용)
+            sustained_outliers = sustained_outliers[:1]  # 기본 1개, 효과적이면 2개까지
+
+            # notch 적용 (signal_for_notch에 적용)
+            filtered_signal = signal_for_notch.copy()
+            for idx in sustained_outliers:
+                notch_freq = f_hr[idx]
+                w0 = notch_freq / (fs / 2.0)  # 정규화된 주파수
+
+                # IIR notch 필터 (Q=30으로 좁게)
+                b, a = iirnotch(w0, Q=30.0)
+                sos = tf2sos(b, a)
+
+                # 오프라인 필터링 (sosfiltfilt)
+                filtered_signal = sosfiltfilt(sos, filtered_signal)
+
+            return filtered_signal
+
+        except Exception as e:
+            print(f"프리필터링 에러: {e}")
+            return signal_for_notch  # 에러시 원본 반환
+
+    def _compute_psd_confidence(self, signal_segment: np.ndarray, fs: float) -> float:
+        """PSD 기반 신호 신뢰도 계산 (프리필터링 적용된 세그먼트용)
+
+        Args:
+            signal_segment: 0.5초 세그먼트 신호 (dphi_bp_segment)
+            fs: 샘플링 주파수
+
+        Returns:
+            confidence: 0-1 사이 신뢰도 (1 = 고품질 HR 신호)
+        """
+        try:
+            from scipy.signal import welch
+
+            # 세그먼트가 너무 짧으면 기본값 반환
+            if len(signal_segment) < 32:  # 최소 32샘플
+                return 0.5
+
+            # Welch PSD 계산 (세그먼트 크기에 맞게)
+            nperseg = min(64, len(signal_segment))  # 최대 64샘플 세그먼트
+            noverlap = nperseg // 2  # 50% overlap
+
+            f, Pxx = welch(signal_segment, fs=fs, window='hann',
+                          nperseg=nperseg, noverlap=noverlap,
+                          detrend='constant', scaling='density')
+
+            # HR 대역 (0.8-3 Hz) 추출
+            hr_mask = (f >= 0.8) & (f <= 3.0)
+            if not np.any(hr_mask):
+                return 0.3  # HR 대역 없음
+
+            f_hr = f[hr_mask]
+            P_hr = Pxx[hr_mask]
+
+            # 신뢰도 계산 지표들
+            if len(P_hr) > 0:
+                # 1. HR 대역 피크 강도 (전체 파워 대비)
+                hr_power = np.sum(P_hr)
+                total_power = np.sum(Pxx) + 1e-10
+                hr_ratio = hr_power / total_power
+
+                # 2. 피크 날카로움 (최대/평균 비율)
+                peak_sharpness = np.max(P_hr) / (np.mean(P_hr) + 1e-10)
+
+                # 3. 잡음 바닥 레벨 (하위 25% 분위수)
+                noise_floor = np.percentile(P_hr, 25)
+
+                # 종합 신뢰도 (0-1 스케일)
+                confidence = hr_ratio * np.tanh(peak_sharpness / 10.0) * (1.0 - noise_floor / (np.max(P_hr) + 1e-10))
+
+                # 범위 제한
+                confidence = np.clip(confidence, 0.0, 1.0)
+
+                return float(confidence)
+            else:
+                return 0.3
+
+        except Exception as e:
+            print(f"PSD 신뢰도 계산 에러: {e}")
+            return 0.5  # 중간값 반환
+
     def load_all_training_data(self) -> Tuple[List[np.ndarray], List[np.ndarray]]:
         """모든 학습 파일 로딩"""
         pairs = find_matching_files(self.train_data_dir, self.train_answer_dir)
@@ -454,7 +415,7 @@ class BPMPredictor:
             print(f"  {i+1}. 파일 {file_num}: {data_path}")
             
             # 데이터 로딩
-            fc_bin, z_tau = calculation(data_path)
+            fc_bin, z_tau = calculation(data_path, FS_ADC, NUM_SAMPLES, PAD_FT, B_HZ)
             gt_times = load_ground_truth(answer_path)
             
             if gt_times is not None:
@@ -498,63 +459,119 @@ class BPMPredictor:
         return all_z_tau, all_gt_times
     
     def process_window(self, window: np.ndarray) -> np.ndarray:
-        """8초 윈도우를 8개 구간으로 나누어 위상미분 신호를 직접 사용 (FFT 없음)"""
+        """8초 윈도우를 8개 구간으로 나누어 위상미분 신호를 직접 사용 (개선된 신호 처리 순서)"""
         
-        # 8초 전체에 먼저 BPF 적용: 50 BPM 이상 (0.83 Hz 이상) 통과, 5차 필터 사용
-        # 50 BPM = 0.83 Hz, 200 BPM = 3.33 Hz
-        low_freq = FMIN  # Hz (48 BPM)
-        high_freq = FMAX  # Hz (180 BPM)
+        # ===== 개선된 신호 처리 순서 =====
+        # Before: z_tau(복소) → BPF(0.8-3 Hz) → angle() → unwrap() → 미분
+        # After:  z_tau(복소) → angle() → unwrap() → HPF(0.3 Hz) → 미분 → BPF(0.8-3 Hz)
         
-        # 5차 Butterworth BPF 설계
-        from scipy.signal import butter, filtfilt
-        nyquist = FS / 2.0
-        low_norm = low_freq / nyquist
-        high_norm = high_freq / nyquist
-        
-        # 5차 Butterworth BPF 계수 계산
-        b, a = butter(5, [low_norm, high_norm], btype='band')
-        
-        # 제로패딩으로 필터링 (경계 효과 방지)
-        pad_len = len(window) // 4
-        window_padded = np.pad(window, (pad_len, pad_len), mode='edge')
-        
-        # 양방향 필터링으로 위상 왜곡 방지
-        window_filtered = filtfilt(b, a, window_padded)
-        
-        # 패딩 제거
-        window_filtered = window_filtered[pad_len:-pad_len]
-        
-        # 8초 전체에서 먼저 위상미분 추출 (시간적 연속성 확보)
         try:
-            # 전체 8초 윈도우에서 위상미분 추출
-            dphi_full = extract_phase_derivative(window_filtered, FS)
+            # 1단계: 복소 신호에서 위상 추출 (HPF 전처리만, 정규화는 1초 구간별로)
+            dphi_full = extract_phase_derivative(window, FS, apply_hpf=True, hpf_freq=0.3, normalize=False)
             
-            # 8초 전체 위상미분을 8개 구간으로 분할
-            sub_intervals = WIN_FRAMES // HOP_FRAMES  # 8개 구간
-            sub_window_size = HOP_FRAMES              # 36프레임 = 1초
+            # 2단계: 위상 신호에 BPF(0.8-3 Hz) 적용
+            from scipy.signal import butter, sosfiltfilt, welch, iirnotch, tf2sos
+            from scipy.ndimage import median_filter
+            from helpers.preproc_lstm import compute_harmonic_features, compute_energy_features
+            
+            low_freq = FMIN   # Hz (48 BPM)
+            high_freq = FMAX  # Hz (180 BPM)
+            nyquist = FS / 2.0
+            low_norm = low_freq / nyquist
+            high_norm = high_freq / nyquist
+            
+            # 2차 Butterworth BPF 계수 계산 (SOS 형태)
+            sos_bpf = butter(2, [low_norm, high_norm], btype='band', output='sos')
+            dphi_bp = sosfiltfilt(sos_bpf, dphi_full, padtype='odd')
+
+            # 2.5단계: 프리필터링 (이상치 주파수 notch 제거)
+            # PSD 검출은 HPF만 적용한 dphi_full로, notch 적용은 dphi_bp에
+            dphi_bp = self._apply_pre_filtering(dphi_full, dphi_bp, FS)
+            
+            # 복소 신호 크기 추출 (|z|_HPF) - 내장 패딩 사용
+            z_magnitude = np.abs(window)
+            
+            # HPF 설계 (2차 Butterworth, 0.3 Hz)
+            hpf_freq = 0.3  # Hz
+            hpf_norm = hpf_freq / nyquist
+            sos_hpf = butter(2, hpf_norm, btype='high', output='sos')
+            
+            # HPF 적용 (크기에) - 내장 패딩 사용
+            z_magnitude_hpf = sosfiltfilt(sos_hpf, z_magnitude, padtype='odd')
+            
+            # 3단계: 8초 전체에서 하모닉/에너지 피처 1회 계산
+            h2_top1, h2_top2 = compute_harmonic_features(dphi_bp, dphi_full, FS)
+            E_lo_norm, SNR_hr = compute_energy_features(dphi_bp, FS)
+            
+            # 4단계: 6채널 입력 생성 [dφ_BPF, dφ, H2_top1, SNR_hr, E_lo_norm, |z|_HPF]
+            sub_intervals = WIN_FRAMES // HOP_FRAMES  # 16개 구간
+            sub_window_size = HOP_FRAMES              # 18프레임 = 0.5초
             sub_features = []
+            
+            # 3초 롤링 컨텍스트 정규화 (라벨 창과 동기화)
+            span = int(round(3.0 * FS))  # 3초 = 108프레임
+            
+            # 3초 컨텍스트 기반 Robust 정규화 함수
+            def rznorm_ctx(x, ctx):
+                med = np.median(ctx)
+                mad = np.median(np.abs(ctx - med)) + 1e-6
+                return (x - med) / mad
             
             for i in range(sub_intervals):
                 start_idx = i * sub_window_size
-                end_idx = (i + 1) * sub_window_size if i < sub_intervals - 1 else len(dphi_full)
+                end_idx = (i + 1) * sub_window_size if i < sub_intervals - 1 else len(dphi_bp)
                 
-                # 전체 위상미분에서 해당 구간 추출
+                # 3초 롤링 컨텍스트 (직전 3초 구간)
+                ctx_start = max(0, end_idx - span)
+                ctx_slice_bp = dphi_bp[ctx_start:end_idx]
+                ctx_slice_dph = dphi_full[ctx_start:end_idx]
+                ctx_slice_mag = z_magnitude_hpf[ctx_start:end_idx]
+                
+                # 각 구간에서 6채널 추출 및 3초 컨텍스트 정규화
+                dphi_bp_segment = dphi_bp[start_idx:end_idx]
                 dphi_segment = dphi_full[start_idx:end_idx]
+                z_mag_segment = z_magnitude_hpf[start_idx:end_idx]
                 
-                # 서브윈도우 프레임과 FEATURE_DIM이 같아야 함
-                if len(dphi_segment) == FEATURE_DIM:
-                    sub_features.append(dphi_segment.astype(np.float32))
+                # 3초 컨텍스트 기반 Robust 정규화
+                dphi_bp_segment = rznorm_ctx(dphi_bp_segment, ctx_slice_bp)
+                dphi_segment = rznorm_ctx(dphi_segment, ctx_slice_dph)
+                z_mag_segment = rznorm_ctx(z_mag_segment, ctx_slice_mag)
+                
+                if (len(dphi_bp_segment) == FEATURE_DIM and 
+                    len(dphi_segment) == FEATURE_DIM and 
+                    len(z_mag_segment) == FEATURE_DIM):
+                    
+                    # 7채널 스택: [dφ_BPF, dφ, H2_top1, SNR_hr, E_lo_norm, |z|_HPF, PSD_conf]
+                    h2_top1_channel = np.full(FEATURE_DIM, h2_top1, dtype=np.float32)
+                    snr_hr_channel = np.full(FEATURE_DIM, SNR_hr, dtype=np.float32)
+                    e_lo_norm_channel = np.full(FEATURE_DIM, E_lo_norm, dtype=np.float32)
+
+                    # PSD 기반 신뢰도 계산 (직전 3초 컨텍스트로 계산)
+                    psd_confidence = self._compute_psd_confidence(ctx_slice_bp, FS)
+                    psd_conf_channel = np.full(FEATURE_DIM, psd_confidence, dtype=np.float32)
+
+                    seven_channel = np.stack([
+                        dphi_bp_segment,      # 채널 0: dφ_BPF (3초 컨텍스트 정규화)
+                        dphi_segment,         # 채널 1: dφ (3초 컨텍스트 정규화)
+                        h2_top1_channel,      # 채널 2: H2_top1 (8초 전체에서 계산)
+                        snr_hr_channel,       # 채널 3: SNR_hr (8초 전체에서 계산)
+                        e_lo_norm_channel,    # 채널 4: E_lo_norm (8초 전체에서 계산)
+                        z_mag_segment,        # 채널 5: |z|_HPF (3초 컨텍스트 정규화)
+                        psd_conf_channel      # 채널 6: PSD_conf (프리필터링 신뢰도)
+                    ], axis=0)
+                    
+                    sub_features.append(seven_channel.astype(np.float32))
                 else:
-                    print(f"위상미분 구간 크기 불일치: {len(dphi_segment)} != {FEATURE_DIM}")
-                    raise ValueError(f"위상미분 구간 크기 불일치: {len(dphi_segment)} != {FEATURE_DIM}")
+                    print(f"위상미분 구간 크기 불일치: {len(dphi_bp_segment)} != {FEATURE_DIM}")
+                    raise ValueError(f"위상미분 구간 크기 불일치: {len(dphi_bp_segment)} != {FEATURE_DIM}")
 
         except Exception as e:
             print(f"위상미분 추출 중 에러 발생: {e}")
             raise e
         
-        # (8, FEATURE_DIM)으로 결합
-        feats = np.array(sub_features, dtype=np.float32)  # (8, 36)
-        # 서브구간(행)별 z-score 정규화 제거: 크기/스케일 정보 보존
+        # (16, 6, FEATURE_DIM)으로 결합
+        feats = np.array(sub_features, dtype=np.float32)  # (16, 6, 36)
+        # 3초 롤링 컨텍스트 정규화로 라벨 창과 동기화, 하모닉/에너지 피처는 8초 전체에서 1회 계산
         return feats
     
     def train_on_multiple_files(self, all_z_tau: List[np.ndarray], all_gt_times: List[np.ndarray], batch_size: int = 32):
@@ -575,13 +592,16 @@ class BPMPredictor:
         ])
         
         # 학습/검증 데이터 생성 및 DataLoader 설정
-        X_train, y_train, X_val, y_val = create_training_data(all_z_tau, all_gt_times, self)
+        X_train, y_train, X_val, y_val = create_training_data(
+            all_z_tau, all_gt_times, self, WIN_FRAMES, HOP_FRAMES, 
+            FRAME_REPETITION_TIME_S, VALIDATION_SPLIT
+        )
         
         # 라벨 정규화 통계 계산 후 Huber Loss의 beta 조정
         beta_bpm = 3.0                             # 2~4 BPM 중 하나로 튜닝
         beta_std = beta_bpm / self.label_std        # z-스케일 임계치
         
-        criterion = torch.nn.SmoothL1Loss(beta=beta_std)
+        criterion = torch.nn.SmoothL1Loss(beta=beta_std, reduction='none')  # 학습/검증/테스트 모두 동일
         print(f"Huber Loss beta 조정: {beta_bpm} BPM -> {beta_std:.3f} (z-scale)")
         # criterion = torch.nn.SmoothL1Loss(beta=4.0)  # Huber loss
         
@@ -643,8 +663,27 @@ class BPMPredictor:
                 optimizer.zero_grad()
                 bpm_pred, _ = self.model(features, None)
                 
-                # loss = F.mse_loss(bpm_pred.squeeze(), labels)
-                loss = criterion(bpm_pred.squeeze(), labels) # Huber loss (정규화 라벨 기준)
+                # SNR + PSD + 극단 BPM 가중치 적용
+                pred = bpm_pred.squeeze()
+                base = criterion(pred, labels)
+
+                # SNR 기반 가중치 계산 (채널 3: SNR_hr)
+                snr = features[:, :, 3, :].mean(dim=(1,2))  # (B,) - 배치별 평균 SNR
+                snr_w = (snr - snr.median()) / (snr.std() + 1e-6)
+                snr_w = snr_w.clamp(-1, 2) * 0.2 + 1.0  # 0.8~1.4 범위
+
+                # PSD 신뢰도 기반 가중치 계산 (채널 6: PSD_conf)
+                psd_conf = features[:, :, 6, :].mean(dim=(1,2))  # (B,) - 배치별 평균 PSD 신뢰도
+                psd_w = 0.5 + 0.5 * psd_conf  # 0.5~1.0 범위 (신뢰도가 높을수록 가중치 증가)
+
+                # 실제 BPM으로 변환하여 BPM 가중치 계산
+                true_bpm = labels * self.label_std + self.label_mean
+                bpm_w = torch.ones_like(true_bpm)
+                bpm_w = bpm_w + 0.5 * (true_bpm < 80).float() + 0.2 * (true_bpm > 95).float()
+
+                # 최종 결합 가중치
+                combined_w = bpm_w * snr_w.unsqueeze(1) * psd_w.unsqueeze(1)
+                loss = (combined_w * base).mean()
                 # MAE는 BPM 단위로 계산 (역정규화)
                 if (self.label_mean is not None) and (self.label_std is not None):
                     pred_bpm = bpm_pred.squeeze() * self.label_std + self.label_mean
@@ -675,7 +714,7 @@ class BPMPredictor:
                     bpm_pred, _ = self.model(features, None)
                     
                     # 훈련과 동일한 Huber Loss 사용 (정규화 라벨 기준)
-                    loss = criterion(bpm_pred.squeeze(), labels)
+                    loss = criterion(bpm_pred.squeeze(), labels).mean()  # 검증에서는 평균 loss 사용
                     # MAE는 BPM 단위로 계산 (역정규화)
                     if (self.label_mean is not None) and (self.label_std is not None):
                         pred_bpm = bpm_pred.squeeze() * self.label_std + self.label_mean
@@ -767,8 +806,8 @@ class BPMPredictor:
         # 예측 BPM
         pred_bpms = self._predict_windows(z_tau)
         
-        # 정답 BPM (이미 실제 BPM 값)
-        true_bpms = create_bpm_labels(gt_times, z_tau)
+        # 정답 BPM (이미 실제 BPM 값) - 창 경계 편향 제거된 계산
+        true_bpms = create_bpm_labels(gt_times, z_tau, WIN_FRAMES, HOP_FRAMES, FRAME_REPETITION_TIME_S, 3.0)
         
         if len(pred_bpms) == 0 or len(true_bpms) == 0:
             return {"rmse": 0.0, "mae": 0.0, "avg_pred_bpm": 0.0, "avg_true_bpm": 0.0}
@@ -789,7 +828,8 @@ class BPMPredictor:
         """예측 성능을 구간별로 상세 평가"""
  
         pred_bpms, window_times = self.predict_bpm(z_tau)
-        true_bpms = create_bpm_labels(gt_times, z_tau)
+        window_sec = WIN_FRAMES * FRAME_REPETITION_TIME_S  # 8초 창
+        true_bpms = create_bpm_labels(gt_times, z_tau, WIN_FRAMES, HOP_FRAMES, FRAME_REPETITION_TIME_S, window_sec)
         
         # 길이 맞춤
         min_len = min(len(pred_bpms), len(true_bpms))
@@ -801,7 +841,7 @@ class BPMPredictor:
         
         # 원하는 구간 길이(초)와 현재 홉 간격으로부터 구간 당 윈도우 개수 계산
         target_interval_sec = 4
-        step_seconds = HOP_FRAMES / FS
+        step_seconds = HOP_FRAMES / FS  # 0.5초
         total_duration = len(z_tau) / FS
         interval_size = max(1, int(round(target_interval_sec / step_seconds)))
         for start_idx in range(0, len(pred_bpms), interval_size):
@@ -851,7 +891,7 @@ class BPMPredictor:
             print(f"\n파일 {file_num} 테스트:")
             
             # 테스트 데이터 직접 로딩
-            fc_bin, test_z_tau = calculation(test_data_path)
+            fc_bin, test_z_tau = calculation(test_data_path, FS_ADC, NUM_SAMPLES, PAD_FT, B_HZ)
             test_gt_times = load_ground_truth(test_answer_path)
             
             if test_gt_times is not None:
@@ -913,8 +953,9 @@ class BPMPredictor:
         total_loss = 0.0
         count = 0
         
-        # Huber Loss 사용 (훈련과 동일)
-        criterion = torch.nn.SmoothL1Loss(beta=3.0 / self.label_std if self.label_std else 3.0)
+        # Huber Loss 사용 (훈련과 동일한 beta)
+        beta_std = 3.0 / self.label_std if self.label_std else 3.0
+        criterion = torch.nn.SmoothL1Loss(beta=beta_std)
         
         with torch.no_grad():
             for i in range(WIN_FRAMES, len(z_tau), HOP_FRAMES):
@@ -937,7 +978,7 @@ class BPMPredictor:
                     # 라벨 정규화 적용
                     if self.label_mean is not None and self.label_std is not None:
                         true_bpm_normalized = (true_bpm - self.label_mean) / self.label_std
-                        loss = criterion(bpm_pred.squeeze(), torch.tensor(true_bpm_normalized).to(self.device))
+                        loss = criterion(bpm_pred.squeeze(), torch.tensor(true_bpm_normalized).to(self.device).unsqueeze(0))
                         total_loss += loss.item()
                         count += 1
         

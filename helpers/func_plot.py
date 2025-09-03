@@ -3,6 +3,8 @@ import os
 import warnings
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.use('TkAgg')  # PyQt5 대신 TkAgg 사용
 
 from typing import List
 
@@ -76,9 +78,3 @@ def plot_test_results(test_losses: List[float], test_maes: List[float], test_rms
         plt.close()
     
     print(f"테스트 결과 그래프 저장 완료: {save_dir}/test_results.png")
-    
-    # 통계 요약 출력
-    print(f"\n=== 테스트 결과 통계 ===")
-    print(f"평균 Loss: {np.mean(test_losses):.6f} ± {np.std(test_losses):.6f}")
-    print(f"평균 MAE: {np.mean(test_maes):.2f} ± {np.std(test_maes):.2f} BPM")
-    print(f"평균 RMSE: {np.mean(test_rmses):.2f} ± {np.std(test_rmses):.2f} BPM")
