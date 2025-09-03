@@ -2,6 +2,7 @@
 import numpy as np
 import os
 import torch
+from torch.utils.data import Dataset, Sampler
 from scipy.signal import butter, filtfilt, get_window, welch, find_peaks
 from typing import Tuple, List, Optional, Dict
 from helpers.preproc_signal import range_axis_m
@@ -388,14 +389,23 @@ def create_training_data(all_z_tau: List[np.ndarray], all_gt_times: List[np.ndar
     
     # 훈련 인덱스는 검증 인덱스를 제외한 나머지
     train_indices = [i for i in range(num_files) if i not in set(val_indices)]
-    
-    # 훈련 데이터 결합
+
+    # ===== 파일 단위 랜덤 셔플 (부드러움 제약을 위한 시간 순서 유지) =====
+    # 파일 내 윈도우 순서는 유지하되, 파일 순서만 랜덤하게 섞음
+    rng.shuffle(train_indices)  # 파일 순서 랜덤화
+    print(f"훈련 파일 {len(train_indices)}개를 랜덤하게 섞음 (각 파일 내 시간 순서 유지)")
+
+    # 훈련 데이터 결합 (섞인 파일 순서대로)
     train_features = []
     train_labels = []
     for idx in train_indices:
         train_features.extend(file_features[idx])
         train_labels.extend(file_labels[idx])
     
+    # ===== 검증 데이터도 파일 단위 랜덤 셔플 =====
+    rng.shuffle(val_indices)  # 검증 파일도 랜덤하게 섞음
+    print(f"검증 파일 {len(val_indices)}개를 랜덤하게 섞음")
+
     # 검증 데이터 결합
     val_features = []
     val_labels = []
@@ -424,8 +434,116 @@ def create_training_data(all_z_tau: List[np.ndarray], all_gt_times: List[np.ndar
     print(f"  훈련 파일: {len(train_indices)}개, 윈도우: {len(X_train)}개")
     print(f"  검증 파일: {len(val_indices)}개, 윈도우: {len(X_val)}개")
     
-    return (torch.from_numpy(X_train), torch.from_numpy(y_train), 
-            torch.from_numpy(X_val), torch.from_numpy(y_val))
+    # 파일별로 그룹화된 데이터도 반환 (FileBatchSampler용)
+    # 정규화된 라벨을 사용하도록 수정
+    train_file_features = [file_features[idx] for idx in train_indices]
+    train_file_labels = [file_labels[idx] for idx in train_indices]
+    val_file_features = [file_features[idx] for idx in val_indices]
+    val_file_labels = [file_labels[idx] for idx in val_indices]
+
+    # 라벨 정규화 통계 계산 후 파일별 라벨도 정규화
+    if predictor.label_std > 0:
+        # 파일별 라벨 정규화 적용
+        for i in range(len(train_file_labels)):
+            train_file_labels[i] = (train_file_labels[i] - predictor.label_mean) / predictor.label_std
+        for i in range(len(val_file_labels)):
+            val_file_labels[i] = (val_file_labels[i] - predictor.label_mean) / predictor.label_std
+
+    return (torch.from_numpy(X_train), torch.from_numpy(y_train),
+            torch.from_numpy(X_val), torch.from_numpy(y_val),
+            train_file_features, train_file_labels,
+            val_file_features, val_file_labels)
+
+class FileGroupedDataset(Dataset):
+    """파일별로 그룹화된 데이터셋 - 각 배치가 동일 파일의 연속 샘플만 포함하도록 보장"""
+
+    def __init__(self, file_features: List[np.ndarray], file_labels: List[np.ndarray]):
+        self.file_features = file_features
+        self.file_labels = file_labels
+        self.file_lengths = [len(features) for features in file_features]
+
+        # 누적 오프셋 계산 (파일별 시작 인덱스)
+        self.cumulative_lengths = [0]
+        for length in self.file_lengths:
+            self.cumulative_lengths.append(self.cumulative_lengths[-1] + length)
+
+        self.total_samples = sum(self.file_lengths)
+
+    def __len__(self):
+        return self.total_samples
+
+    def __getitem__(self, idx):
+        # 어느 파일에 속하는지 찾기
+        file_idx = 0
+        for i, cum_len in enumerate(self.cumulative_lengths[1:], 0):
+            if idx < cum_len:
+                file_idx = i
+                break
+
+        # 파일 내 상대 인덱스 계산
+        local_idx = idx - self.cumulative_lengths[file_idx]
+
+        feature = self.file_features[file_idx][local_idx]
+        label = self.file_labels[file_idx][local_idx]
+
+        # 안전하게 tensor로 변환 (스칼라 값도 처리 가능)
+        return torch.tensor(feature, dtype=torch.float32), torch.tensor(label, dtype=torch.float32)
+
+
+class FileBatchSampler(Sampler):
+    """파일별로 그룹화된 배치 샘플러 - 각 배치가 동일 파일의 연속 샘플만 포함"""
+
+    def __init__(self, file_lengths: List[int], batch_size: int, drop_last: bool = False,
+                 shuffle_files: bool = True, seed: int = 42):
+        self.file_lengths = file_lengths
+        self.batch_size = batch_size
+        self.drop_last = drop_last
+        self.shuffle_files = shuffle_files
+        self.seed = seed
+        self.rng = np.random.RandomState(seed)
+
+        # 파일별 배치 생성
+        self.batches = []
+        file_indices = list(range(len(file_lengths)))
+
+        if shuffle_files:
+            self.rng.shuffle(file_indices)
+
+        for file_idx in file_indices:
+            file_len = file_lengths[file_idx]
+            start_idx = sum(file_lengths[:file_idx])
+
+            # 파일 내에서 배치 생성
+            for batch_start in range(0, file_len, batch_size):
+                batch_end = min(batch_start + batch_size, file_len)
+                if not drop_last or (batch_end - batch_start) == batch_size:
+                    batch_indices = [start_idx + i for i in range(batch_start, batch_end)]
+                    self.batches.append(batch_indices)
+
+    def __iter__(self):
+        # 에포크마다 파일 순서 재셔플
+        if self.shuffle_files:
+            file_indices = list(range(len(self.file_lengths)))
+            self.rng.shuffle(file_indices)
+
+            new_batches = []
+            for file_idx in file_indices:
+                file_len = self.file_lengths[file_idx]
+                start_idx = sum(self.file_lengths[:file_idx])
+
+                for batch_start in range(0, file_len, self.batch_size):
+                    batch_end = min(batch_start + self.batch_size, file_len)
+                    if not self.drop_last or (batch_end - batch_start) == self.batch_size:
+                        batch_indices = [start_idx + i for i in range(batch_start, batch_end)]
+                        new_batches.append(batch_indices)
+
+            self.batches = new_batches
+
+        return iter(self.batches)
+
+    def __len__(self):
+        return len(self.batches)
+
 
 def compute_spectrum_features(signal: np.ndarray, fs: float, pad_factor: int,
                              fmin: float, fmax: float) -> Tuple[np.ndarray, np.ndarray]:

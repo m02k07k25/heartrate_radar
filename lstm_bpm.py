@@ -10,7 +10,7 @@ import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import TensorDataset, DataLoader
+from torch.utils.data import TensorDataset, DataLoader, Dataset, Sampler
 from sklearn.model_selection import train_test_split
 from helpers.func_plot import plot_training_curves, plot_test_results
 from helpers.preproc_lstm import (
@@ -22,7 +22,7 @@ from typing import Tuple, List, Optional, Dict
 
 # ===== 학습 파라미터 =====
 EPOCHS = 1000                 # 에포크
-LEARNING_RATE = 5e-5          # 직접 BPM 예측용 낮은 학습률 (과적합 방지)
+LEARNING_RATE = 1e-4  # 학습률 증가로 다양성 향상          # 직접 BPM 예측용 낮은 학습률 (과적합 방지)
 HIDDEN_DIM = 128
 NUM_LAYERS = 2                # LSTM 레이어 2층 및 드롭아웃 적용
 
@@ -41,6 +41,9 @@ WIN_FRAMES  = int(8.0 * FS)   # 8초 윈도우 = 288 프레임
 HOP_FRAMES  = int(0.5 * FS)   # 0.5초 홉 = FS/2 프레임
 FMIN, FMAX  = 0.8, 3.0      # 심박 대역 [Hz] (48-180 BPM에 대응) - BPF 적용
 FEATURE_DIM = 18              # 1D CNN으로 압축할 특징 차원 -> 홉수
+
+# ===== 부드러움 제약 파라미터 =====
+SMOOTH_LAMBDA = 0.003           # 부드러움 제약 강도 더 증가 (데이터 손실의 5-10% 수준으로)
 
 # ===== 경로 설정 =====
 TRAIN_DATA_DIR = "record3/train/data/"
@@ -66,8 +69,9 @@ torch.backends.cudnn.benchmark = False
 
 # ===== 데이터 처리 함수들 (preproc_lstm.py에서 import) =====
 from helpers.preproc_lstm import (
-    calculation, find_matching_files, load_ground_truth, 
-    create_bpm_labels, create_training_data
+    calculation, find_matching_files, load_ground_truth,
+    create_bpm_labels, create_training_data,
+    FileGroupedDataset, FileBatchSampler
 )
 
 # ===== 1D CNN + LSTM BPM 회귀 모델 정의 =====
@@ -97,30 +101,31 @@ class BPMRegressionModel(nn.Module):
         
         # ===== 근본적 문제 해결: 모델 구조 단순화 =====
         # 회귀 헤드 단순화 (과적합 방지, 예측 안정성 향상)
+        # 회귀: LSTM 출력을 BPM으로 변환 (평균 수렴 방지용 더 큰 용량)
         self.regressor = nn.Sequential(
-            nn.Linear(hidden, hidden // 4),
+            nn.Linear(hidden, hidden // 2),  # 128 -> 64 (더 큰 용량)
             nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(hidden // 4, hidden // 16),
+            nn.Dropout(0.3),  # 드롭아웃 증가로 과적합 방지
+            nn.Linear(hidden // 2, hidden // 4),  # 64 -> 32
             nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden // 16, 1),  # BPM 값 직접 출력
+            nn.Dropout(0.2),  # 드롭아웃 증가
+            nn.Linear(hidden // 4, 1),  # 32 -> 1 (BPM 값 직접 출력)
         )
         
         # 가중치 초기화
         self._initialize_weights()
         
-        # 마지막 레이어를 적절한 범위로 재초기화
+        # 마지막 레이어를 더 큰 범위로 재초기화 (다양성 증가)
         with torch.no_grad():
-            self.regressor[-1].weight.normal_(0, 0.05)
-            self.regressor[-1].bias.zero_()
+            self.regressor[-1].weight.normal_(0, 0.2)  # 가중치 분산 증가
+            self.regressor[-1].bias.normal_(0, 0.1)    # 바이어스도 랜덤 초기화
         
         # 모델 구조 출력
         print(f"BPM 회귀 모델 구조:")
         print(f"  1D CNN: 7채널({input_dim}) -> 64 (Conv1d 1개)")
         print(f"    채널: [dφ_BPF, dφ, H2_top1, SNR_hr, E_lo_norm, |z|_HPF, PSD_conf]")
         print(f"  LSTM: 64 -> {hidden} (layers={num_layers})")
-        print(f"  Regressor: {hidden} -> 1 (직접 BPM 출력)")
+        print(f"  Regressor: {hidden} -> {hidden//2} -> {hidden//4} -> 1 (강화된 BPM 출력)")
         
     def _initialize_weights(self):
         """가중치 초기화"""
@@ -542,13 +547,20 @@ class BPMPredictor:
                     len(z_mag_segment) == FEATURE_DIM):
                     
                     # 7채널 스택: [dφ_BPF, dφ, H2_top1, SNR_hr, E_lo_norm, |z|_HPF, PSD_conf]
+                    # 전역 특성들을 시간축에 따라 약간의 변동 추가 (표준편차 0 방지)
                     h2_top1_channel = np.full(FEATURE_DIM, h2_top1, dtype=np.float32)
+                    h2_top1_channel += np.random.normal(0, 0.01, FEATURE_DIM).astype(np.float32)  # 작은 노이즈 추가
+                    
                     snr_hr_channel = np.full(FEATURE_DIM, SNR_hr, dtype=np.float32)
+                    snr_hr_channel += np.random.normal(0, 0.01, FEATURE_DIM).astype(np.float32)  # 작은 노이즈 추가
+                    
                     e_lo_norm_channel = np.full(FEATURE_DIM, E_lo_norm, dtype=np.float32)
+                    e_lo_norm_channel += np.random.normal(0, 0.01, FEATURE_DIM).astype(np.float32)  # 작은 노이즈 추가
 
                     # PSD 기반 신뢰도 계산 (직전 3초 컨텍스트로 계산)
                     psd_confidence = self._compute_psd_confidence(ctx_slice_bp, FS)
                     psd_conf_channel = np.full(FEATURE_DIM, psd_confidence, dtype=np.float32)
+                    psd_conf_channel += np.random.normal(0, 0.01, FEATURE_DIM).astype(np.float32)  # 작은 노이즈 추가
 
                     seven_channel = np.stack([
                         dphi_bp_segment,      # 채널 0: dφ_BPF (3초 컨텍스트 정규화)
@@ -574,10 +586,24 @@ class BPMPredictor:
         # 3초 롤링 컨텍스트 정규화로 라벨 창과 동기화, 하모닉/에너지 피처는 8초 전체에서 1회 계산
         return feats
     
-    def train_on_multiple_files(self, all_z_tau: List[np.ndarray], all_gt_times: List[np.ndarray], batch_size: int = 32):
+    def train_on_multiple_files(self, all_z_tau: List[np.ndarray], all_gt_times: List[np.ndarray], batch_size: int):
         """여러 파일로 DataLoader 배치 학습 (검증 및 얼리 스탑 포함)"""
+        # ===== 4) 입력 특성(전처리) 점검 =====
         first_features = self.process_window(all_z_tau[0][:WIN_FRAMES])
         print(f"특징 차원: {first_features.shape}")
+
+        # 입력 특성 분포 분석
+        f = first_features  # numpy array
+        print("=== 입력 특성 분석 ===")
+        print(f"first_features shape: {f.shape}")
+        print(f"global mean/std: {f.mean():.4f}, {f.std():.4f}")
+        print(f"min/max: {f.min():.4f}, {f.max():.4f}")
+
+        # 채널별 분포 분석 (7개 채널)
+        for ch in range(f.shape[1]):
+            ch_mean = f[:, ch, :].mean()
+            ch_std = f[:, ch, :].std()
+            print(f"ch{ch} mean/std: {ch_mean:.4f}, {ch_std:.4f}")
         
         self.model = BPMRegressionModel(input_dim=FEATURE_DIM).to(self.device)
         print(f"모델 파라미터 수: {sum(p.numel() for p in self.model.parameters()):,}")
@@ -592,8 +618,10 @@ class BPMPredictor:
         ])
         
         # 학습/검증 데이터 생성 및 DataLoader 설정
-        X_train, y_train, X_val, y_val = create_training_data(
-            all_z_tau, all_gt_times, self, WIN_FRAMES, HOP_FRAMES, 
+        (X_train, y_train, X_val, y_val,
+         train_file_features, train_file_labels,
+         val_file_features, val_file_labels) = create_training_data(
+            all_z_tau, all_gt_times, self, WIN_FRAMES, HOP_FRAMES,
             FRAME_REPETITION_TIME_S, VALIDATION_SPLIT
         )
         
@@ -618,28 +646,43 @@ class BPMPredictor:
         print(f"검증 데이터 비율: {VALIDATION_SPLIT*100:.0f}%, 얼리 스탑 인내심: {EARLY_STOP_PATIENCE} 에포크")
         print(f"스케줄러: ReduceLROnPlateau (factor={SCHEDULER_FACTOR}, patience={SCHEDULER_PATIENCE})")
         
-        train_dataset = TensorDataset(X_train, y_train)
-        val_dataset = TensorDataset(X_val, y_val)
-        
-        train_dataloader = DataLoader(
-            train_dataset, 
-            batch_size=batch_size, 
-            shuffle=True,  # 에포크마다 자동 셔플링
-            num_workers=0,  # Windows에서 안정적
-            pin_memory=torch.cuda.is_available(),
-            drop_last=False # 마지막 배치 버리지 않음
-        )
-        
-        val_dataloader = DataLoader(
-            val_dataset,
+        # ===== 파일별 그룹화된 데이터셋 생성 (부드러움 제약용) =====
+        train_grouped_dataset = FileGroupedDataset(train_file_features, train_file_labels)
+        val_grouped_dataset = FileGroupedDataset(val_file_features, val_file_labels)
+
+        # 파일별 배치 샘플러 생성 (각 배치가 동일 파일의 연속 샘플만 포함)
+        train_sampler = FileBatchSampler(
+            file_lengths=train_grouped_dataset.file_lengths,
             batch_size=batch_size,
-            shuffle=False,  # 검증은 셔플 불필요
+            drop_last=False,
+            shuffle_files=True,  # 파일 순서만 랜덤하게 섞음
+            seed=42
+        )
+
+        val_sampler = FileBatchSampler(
+            file_lengths=val_grouped_dataset.file_lengths,
+            batch_size=batch_size,
+            drop_last=False,
+            shuffle_files=True,  # 검증에서도 파일 순서 랜덤화
+            seed=42
+        )
+
+        train_dataloader = DataLoader(
+            train_grouped_dataset,
+            batch_sampler=train_sampler,  # batch_sampler 사용
+            num_workers=0,  # Windows에서 안정적
+            pin_memory=torch.cuda.is_available()
+        )
+
+        val_dataloader = DataLoader(
+            val_grouped_dataset,
+            batch_sampler=val_sampler,  # batch_sampler 사용
             num_workers=0,
-            pin_memory=torch.cuda.is_available(),
-            drop_last=False
+            pin_memory=torch.cuda.is_available()
         )
         
-        print(f"DataLoader 생성: 훈련 {len(train_dataset)}개, 검증 {len(val_dataset)}개 윈도우")
+        print(f"DataLoader 생성: 훈련 {len(train_grouped_dataset)}개, 검증 {len(val_grouped_dataset)}개 윈도우")
+        print(f"파일별 배치 생성: 훈련 {len(train_sampler)}개, 검증 {len(val_sampler)}개 배치")
         
         # 얼리 스탑 변수들
         best_val_loss = float('inf')
@@ -665,7 +708,13 @@ class BPMPredictor:
                 
                 # SNR + PSD + 극단 BPM 가중치 적용
                 pred = bpm_pred.squeeze()
-                base = criterion(pred, labels)
+                labels_squeezed = labels.squeeze()
+
+                # 차원 일치 보장 (간단화: view(-1)로 1D 텐서 통일)
+                # criterion이 reduction='none'이므로 개별 샘플 loss를 반환
+                pred_flat = pred.view(-1)
+                labels_flat = labels_squeezed.view(-1)
+                base = criterion(pred_flat, labels_flat)  # (B,) 형태의 개별 샘플 loss
 
                 # SNR 기반 가중치 계산 (채널 3: SNR_hr)
                 snr = features[:, :, 3, :].mean(dim=(1,2))  # (B,) - 배치별 평균 SNR
@@ -681,19 +730,101 @@ class BPMPredictor:
                 bpm_w = torch.ones_like(true_bpm)
                 bpm_w = bpm_w + 0.5 * (true_bpm < 80).float() + 0.2 * (true_bpm > 95).float()
 
-                # 최종 결합 가중치
-                combined_w = bpm_w * snr_w.unsqueeze(1) * psd_w.unsqueeze(1)
-                loss = (combined_w * base).mean()
+                # ===== 부드러움 제약 추가 (z-score 스케일 통일) =====
+                # 라벨과 같은 z-score 스케일에서 부드러움 제약 계산
+                if pred.shape[0] > 1:  # 배치에 여러 샘플이 있는 경우만
+                    # z-score 스케일에서 연속 예측값들의 차이 계산
+                    diff = pred[1:] - pred[:-1]  # pred는 이미 z-score 정규화된 값
+                    smooth_loss = torch.abs(diff).mean()  # L1 노름
+                else:
+                    smooth_loss = torch.tensor(0.0, device=pred.device)
+
+                # 최종 결합 가중치 (브로드캐스트 버그 수정)
+                # 모든 가중치를 (B,) 형태로 유지해서 element-wise 곱
+                snr_w = snr_w.view(-1)      # (B,) 확실히 보장
+                psd_w = psd_w.view(-1)      # (B,) 확실히 보장
+                bpm_w = bpm_w.view(-1)      # (B,) 확실히 보장
+
+                combined_w = bpm_w * snr_w * psd_w   # (B,), element-wise 곱
+                base = base.view(-1)   # base도 (B,) 확실히 보장
+
+                data_loss = (combined_w * base).mean()
+
+                # ===== 2) data_loss, combined_w, base 분포 확인 =====
+                if epoch == 0 and batch_count < 1:
+                    print("=== 손실 구성 요소 분석 ===")
+                    print(f"base mean/std: {base.mean().item():.4f}, {base.std().item():.4f}")
+                    print(f"combined_w mean/std: {combined_w.mean().item():.4f}, {combined_w.std().item():.4f}")
+                    print(f"data_loss: {data_loss.item():.4f}")
+
+                # 부드러움 제약 결합
+                loss = data_loss + SMOOTH_LAMBDA * smooth_loss
+
+                # ===== 1) 그래디언트/파라미터 업데이트 확인 =====
+                if epoch == 0 and batch_count < 1:
+                    # 파라미터 노름 저장 (업데이트 전)
+                    before_norm = sum(p.data.norm().item() for p in self.model.parameters() if p.requires_grad)
+                    print(f"before_step_norm: {before_norm:.4f}")
+
+                loss.backward()
+
+                # 그래디언트 노름 계산
+                if epoch == 0 and batch_count < 1:
+                    total_grad_norm = 0.0
+                    for p in self.model.parameters():
+                        if p.grad is not None:
+                            total_grad_norm += float(p.grad.data.norm().cpu().item())
+                    print(f"grad norm: {total_grad_norm:.4f}")
+
+                optimizer.step()
+
+                # 파라미터 노름 변화 확인
+                if epoch == 0 and batch_count < 1:
+                    after_norm = sum(p.data.norm().item() for p in self.model.parameters() if p.requires_grad)
+                    param_diff = abs(after_norm - before_norm)
+                    print(f"after_step_norm: {after_norm:.4f}, param_diff: {param_diff:.4f}")
+
+                # 디버깅: 예측값 분포 분석 (첫 에포크만)
+                if epoch == 0 and batch_count < 1:
+                    print(f"[부드러움] 데이터 손실: {data_loss.item():.3f}, 부드러움 손실(L2,z-score): {smooth_loss.item():.3f}, λ: {SMOOTH_LAMBDA}")
+                    print(f"[부드러움] 배치 크기: {pred.shape[0]}, 부드러움 적용: {'예' if pred.shape[0] > 1 else '아니오'}")
+
+                    # 예측값 분포 분석
+                    pred_mean = pred.mean().item()
+                    pred_std = pred.std().item()
+                    pred_min = pred.min().item()
+                    pred_max = pred.max().item()
+                    print(f"[예측 분포] z-score: 평균={pred_mean:.3f}, 표준편차={pred_std:.3f}, 범위=[{pred_min:.3f}, {pred_max:.3f}]")
+
+                    # 라벨 분포 분석
+                    labels_mean = labels.mean().item()
+                    labels_std = labels.std().item()
+                    labels_min = labels.min().item()
+                    labels_max = labels.max().item()
+                    print(f"[라벨 분포] z-score: 평균={labels_mean:.3f}, 표준편차={labels_std:.3f}, 범위=[{labels_min:.3f}, {labels_max:.3f}]")
+
+                    print(f"[라벨 정규화] mean: {self.label_mean:.3f}, std: {self.label_std:.3f}")
                 # MAE는 BPM 단위로 계산 (역정규화)
                 if (self.label_mean is not None) and (self.label_std is not None):
                     pred_bpm = bpm_pred.squeeze() * self.label_std + self.label_mean
                     true_bpm = labels * self.label_std + self.label_mean
                     mae = F.l1_loss(pred_bpm, true_bpm)
+
+                    # BPM 단위 예측값 분포도 분석 (첫 에포크만)
+                    if epoch == 0 and batch_count < 1:
+                        pred_bpm_mean = pred_bpm.mean().item()
+                        pred_bpm_std = pred_bpm.std().item()
+                        pred_bpm_min = pred_bpm.min().item()
+                        pred_bpm_max = pred_bpm.max().item()
+                        print(f"[예측 분포] BPM: 평균={pred_bpm_mean:.1f}, 표준편차={pred_bpm_std:.1f}, 범위=[{pred_bpm_min:.1f}, {pred_bpm_max:.1f}]")
+
+                        true_bpm_mean = true_bpm.mean().item()
+                        true_bpm_std = true_bpm.std().item()
+                        true_bpm_min = true_bpm.min().item()
+                        true_bpm_max = true_bpm.max().item()
+                        print(f"[실제 분포] BPM: 평균={true_bpm_mean:.1f}, 표준편차={true_bpm_std:.1f}, 범위=[{true_bpm_min:.1f}, {true_bpm_max:.1f}]")
                 else:
                     mae = F.l1_loss(bpm_pred.squeeze(), labels)
-                
-                loss.backward()
-                optimizer.step()
                 
                 train_loss += loss.item()
                 train_mae += mae.item()
@@ -709,12 +840,31 @@ class BPMPredictor:
             with torch.no_grad():
                 for features, labels in val_dataloader:
                     features = features.to(self.device)
-                    labels = labels.squeeze().to(self.device)
+                    labels = labels.to(self.device)
                     
                     bpm_pred, _ = self.model(features, None)
                     
-                    # 훈련과 동일한 Huber Loss 사용 (정규화 라벨 기준)
-                    loss = criterion(bpm_pred.squeeze(), labels).mean()  # 검증에서는 평균 loss 사용
+                    # ===== 검증 단계: 순수 데이터 손실만 계산 (부드러움 제약 제외) =====
+                    # 검증에서는 모델 학습이 일어나지 않으므로 부드러움 제약 제외
+                    pred_val = bpm_pred.squeeze()  # 예측값
+                    labels_val = labels.squeeze()  # 라벨
+
+                    # 차원 일치 보장 (간단화: view(-1)로 1D 텐서 통일)
+                    # criterion이 reduction='none'이므로 개별 샘플 loss를 반환
+                    pred_val_flat = pred_val.view(-1)
+                    labels_val_flat = labels_val.view(-1)
+                    base_loss = criterion(pred_val_flat, labels_val_flat)  # (B,) 형태의 개별 샘플 loss
+
+                    # 최종 검증 손실 (부드러움 제약 제외)
+                    # base_loss가 벡터인 경우 평균 계산 (reduction='none' 때문)
+                    if base_loss.numel() > 1:
+                        loss = base_loss.mean()
+                    else:
+                        loss = base_loss.item() if hasattr(base_loss, 'item') else base_loss
+
+                    # 디버깅: 검증 단계 순수 데이터 손실 출력 (첫 배치만)
+                    if batch_count == 0:
+                        print(f"[검증] 순수 데이터 손실: {loss:.3f} (부드러움 제약 제외)")
                     # MAE는 BPM 단위로 계산 (역정규화)
                     if (self.label_mean is not None) and (self.label_std is not None):
                         pred_bpm = bpm_pred.squeeze() * self.label_std + self.label_mean
@@ -953,9 +1103,9 @@ class BPMPredictor:
         total_loss = 0.0
         count = 0
         
-        # Huber Loss 사용 (훈련과 동일한 beta)
+        # Huber Loss 사용 (훈련과 동일한 beta, 개별 샘플 loss)
         beta_std = 3.0 / self.label_std if self.label_std else 3.0
-        criterion = torch.nn.SmoothL1Loss(beta=beta_std)
+        criterion = torch.nn.SmoothL1Loss(beta=beta_std, reduction='none')
         
         with torch.no_grad():
             for i in range(WIN_FRAMES, len(z_tau), HOP_FRAMES):
