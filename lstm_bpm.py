@@ -24,7 +24,7 @@ from typing import Tuple, List, Optional, Dict
 EPOCHS = 1000                 # 에포크
 LEARNING_RATE = 1e-4  # 학습률 증가로 다양성 향상          # 직접 BPM 예측용 낮은 학습률 (과적합 방지)
 HIDDEN_DIM = 128
-NUM_LAYERS = 2                # LSTM 레이어 2층 및 드롭아웃 적용
+NUM_LAYERS = 3                # LSTM 레이어 2층 및 드롭아웃 적용
 
 VALIDATION_SPLIT = 0.25       # 검증 데이터 비율 (20%로 줄임)
 EARLY_STOP_PATIENCE = 200     # 얼리 스탑 인내심 (에포크) - 더 여유롭게
@@ -117,8 +117,8 @@ class BPMRegressionModel(nn.Module):
         
         # 마지막 레이어를 더 큰 범위로 재초기화 (다양성 증가)
         with torch.no_grad():
-            self.regressor[-1].weight.normal_(0, 0.2)  # 가중치 분산 증가
-            self.regressor[-1].bias.normal_(0, 0.1)    # 바이어스도 랜덤 초기화
+            self.regressor[-1].weight.normal_(0, 5.0)  # 가중치 분산 대폭 증가 (0.2 → 5.0)
+            self.regressor[-1].bias.normal_(0, 3.0)    # 바이어스 분산도 증가 (0.1 → 3.0)
         
         # 모델 구조 출력
         print(f"BPM 회귀 모델 구조:")
@@ -724,12 +724,12 @@ class BPMPredictor:
 
                 # PSD 신뢰도 기반 가중치 계산 (채널 6: PSD_conf)
                 psd_conf = features[:, :, 6, :].mean(dim=(1,2))  # (B,) - 배치별 평균 PSD 신뢰도
-                psd_w = 0.5 + 0.5 * psd_conf  # 0.5~1.0 범위 (신뢰도가 높을수록 가중치 증가)
+                psd_w = 0.2 + 0.8 * psd_conf  # 0.5~1.0 범위 (신뢰도가 높을수록 가중치 증가)
 
                 # 실제 BPM으로 변환하여 BPM 가중치 계산
                 true_bpm = labels * self.label_std + self.label_mean
                 bpm_w = torch.ones_like(true_bpm)
-                bpm_w = bpm_w + 0.6 * (true_bpm < 75).float() + 0.2 * (true_bpm > 95).float()
+                bpm_w += 0.7 * (true_bpm < 75).float() + 0.3 * (true_bpm > 95).float()
 
                 # ===== 부드러움 제약 추가 (z-score 스케일 통일) =====
                 # 라벨과 같은 z-score 스케일에서 부드러움 제약 계산
