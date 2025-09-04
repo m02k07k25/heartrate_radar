@@ -343,8 +343,8 @@ def main():
     print("=== z_tau 위상 미분 시각화 (폴더 전체) ===")
     
     # 데이터 폴더 경로
-    data_folder = "record3/test/data"
-    answer_folder = "record3/test/answer"
+    data_folder = "record3/train/data"
+    answer_folder = "record3/train/answer"
     
     if not os.path.exists(data_folder):
         raise ValueError(f"데이터 폴더를 찾을 수 없습니다: {data_folder}")

@@ -21,7 +21,7 @@ from helpers.radar_config import *
 
 DATA_DIR = "record3/train/data"     # 레이더 저장 (.npy)
 ANS_DIR  = "record3/train/answer"   # ECG 저장 (.csv)
-ECG_PORT = "COM8"
+ECG_PORT = "COM6"
 ECG_BAUD = 1_000_000
 
 # ECG 피크 검출 파라미터
@@ -184,8 +184,9 @@ def radar_thread():
         if device is not None:
             try:
                 device.stop_acquisition()
-            except:
-                pass
+            except Exception as e:
+                print(f"[RADAR] 장치 정리 중 오류: {e}")
+                raise e
         print("[RADAR] 종료")
 
 def ecg_thread():
@@ -267,8 +268,9 @@ def ecg_thread():
         if ser is not None:
             try:
                 ser.close()
-            except:
-                pass
+            except Exception as e:
+                print(f"[ECG] 시리얼 포트 정리 중 오류: {e}")
+                raise e
         print("[ECG] 종료")
 
 if __name__ == "__main__":

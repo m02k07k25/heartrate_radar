@@ -22,7 +22,7 @@ from typing import Tuple, List, Optional, Dict
 
 # ===== 학습 파라미터 =====
 EPOCHS = 1000                 # 에포크
-LEARNING_RATE = 5e-4  # 학습률 증가로 다양성 향상          # 직접 BPM 예측용 낮은 학습률 (과적합 방지)
+LEARNING_RATE = 1e-4  # 학습률 증가로 다양성 향상          # 직접 BPM 예측용 낮은 학습률 (과적합 방지)
 HIDDEN_DIM = 128
 NUM_LAYERS = 2                # LSTM 레이어 2층 및 드롭아웃 적용
 
@@ -278,7 +278,7 @@ class BPMPredictor:
             f_hr = f[hr_mask]
             P_hr = Pxx[hr_mask]
 
-            if len(P_hr) == 0:\
+            if len(P_hr) == 0:
                 raise ValueError("HR 대역 데이터 없음")
 
             # 이상치 탐지 (로컬 median 대비 z-score/MAD)
@@ -614,7 +614,7 @@ class BPMPredictor:
         other_params = [p for p in self.model.parameters() if id(p) not in last_param_ids]
         optimizer = torch.optim.Adam([
             {"params": other_params, "lr": LEARNING_RATE},
-            {"params": last_layer_params, "lr": LEARNING_RATE * 5.0},
+            {"params": last_layer_params, "lr": LEARNING_RATE},
         ])
         
         # 학습/검증 데이터 생성 및 DataLoader 설정
@@ -729,7 +729,7 @@ class BPMPredictor:
                 # 실제 BPM으로 변환하여 BPM 가중치 계산
                 true_bpm = labels * self.label_std + self.label_mean
                 bpm_w = torch.ones_like(true_bpm)
-                bpm_w = bpm_w + 0.5 * (true_bpm < 80).float() + 0.2 * (true_bpm > 95).float()
+                bpm_w = bpm_w + 0.6 * (true_bpm < 75).float() + 0.2 * (true_bpm > 95).float()
 
                 # ===== 부드러움 제약 추가 (z-score 스케일 통일) =====
                 # 라벨과 같은 z-score 스케일에서 부드러움 제약 계산
