@@ -487,7 +487,7 @@ class FileGroupedDataset(Dataset):
         label = self.file_labels[file_idx][local_idx]
 
         # 안전하게 tensor로 변환 (스칼라 값도 처리 가능)
-        return torch.tensor(feature, dtype=torch.float32), torch.tensor(label, dtype=torch.float32)
+        return torch.tensor(feature, dtype=torch.float32), torch.tensor(label, dtype=torch.float32), file_idx
 
 
 class FileBatchSampler(Sampler):

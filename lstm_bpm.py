@@ -22,7 +22,7 @@ from typing import Tuple, List, Optional, Dict
 
 # ===== 학습 파라미터 =====
 EPOCHS = 1000                 # 에포크
-LEARNING_RATE = 1e-4  # 학습률 증가로 다양성 향상          # 직접 BPM 예측용 낮은 학습률 (과적합 방지)
+LEARNING_RATE = 1e-4          # 학습률 증가로 다양성 향상          
 HIDDEN_DIM = 128
 NUM_LAYERS = 3                # LSTM 레이어 2층 및 드롭아웃 적용
 
@@ -32,18 +32,18 @@ EARLY_STOP_MIN_DELTA = 5e-5   # 최소 개선 임계값 - 더 관대하게
 
 # ===== 스케줄러 파라미터 =====
 SCHEDULER_FACTOR = 0.5        # 학습률 감소 비율
-SCHEDULER_PATIENCE = 25       # 스케줄러 인내심 (에포크) - 더 빠른 학습률 감소
+SCHEDULER_PATIENCE = 40       # 스케줄러 인내심 (에포크) - 더 빠른 학습률 감소
 SCHEDULER_MIN_LR = 5e-6       # 최소 학습률
 
 # ===== 신호 처리 파라미터 =====
 FS          = FS_FRAME        # 프레임레이트 (Hz) - radar_config에서 가져옴
 WIN_FRAMES  = int(8.0 * FS)   # 8초 윈도우 = 288 프레임
-HOP_FRAMES  = int(0.5 * FS)   # 0.5초 홉 = FS/2 프레임
+HOP_FRAMES  = int(1.0 * FS)   # 1.0초 홉 = FS 프레임
 FMIN, FMAX  = 0.8, 3.0      # 심박 대역 [Hz] (48-180 BPM에 대응) - BPF 적용
-FEATURE_DIM = 18              # 1D CNN으로 압축할 특징 차원 -> 홉수
+FEATURE_DIM = HOP_FRAMES              # 1D CNN으로 압축할 특징 차원 -> 홉수
 
 # ===== 부드러움 제약 파라미터 =====
-SMOOTH_LAMBDA = 0.01           # 부드러움 제약 강도 더 증가 (데이터 손실의 5-10% 수준으로)
+SMOOTH_LAMBDA = 0.1           # 부드러움 제약 강도 더 증가 (데이터 손실의 5-10% 수준으로)
 
 # ===== 경로 설정 =====
 TRAIN_DATA_DIR = "record3/train/data/"
@@ -223,7 +223,7 @@ class BPMRegressionModel(nn.Module):
         # 직접 BPM 회귀 (선형 출력, 클리핑 제거)
         bpm_pred = self.regressor(last_output)  # (batch, 1)
         
-        return bpm_pred, hidden
+        return bpm_pred, hidden, lstm_out
 
 # ===== BPM 예측 시스템 =====
 class BPMPredictor:
@@ -631,7 +631,6 @@ class BPMPredictor:
         
         # criterion 객체는 더 이상 사용하지 않음 (F.smooth_l1_loss 직접 호출)
         print(f"Huber Loss beta 조정: {beta_bpm} BPM -> {beta_std:.3f} (z-scale)")
-        print(f"SmoothL1Loss 직접 호출로 브로드캐스트 경고 제거")
         
         # 학습률 스케줄러 추가 (검증 손실 기반)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -646,43 +645,29 @@ class BPMPredictor:
         print(f"검증 데이터 비율: {VALIDATION_SPLIT*100:.0f}%, 얼리 스탑 인내심: {EARLY_STOP_PATIENCE} 에포크")
         print(f"스케줄러: ReduceLROnPlateau (factor={SCHEDULER_FACTOR}, patience={SCHEDULER_PATIENCE})")
         
-        # ===== 파일별 그룹화된 데이터셋 생성 (부드러움 제약용) =====
-        train_grouped_dataset = FileGroupedDataset(train_file_features, train_file_labels)
-        val_grouped_dataset = FileGroupedDataset(val_file_features, val_file_labels)
-
-        # 파일별 배치 샘플러 생성 (각 배치가 동일 파일의 연속 샘플만 포함)
-        train_sampler = FileBatchSampler(
-            file_lengths=train_grouped_dataset.file_lengths,
-            batch_size=batch_size,
-            drop_last=False,
-            shuffle_files=True,  # 파일 순서만 랜덤하게 섞음
-            seed=42
-        )
-
-        val_sampler = FileBatchSampler(
-            file_lengths=val_grouped_dataset.file_lengths,
-            batch_size=batch_size,
-            drop_last=False,
-            shuffle_files=True,  # 검증에서도 파일 순서 랜덤화
-            seed=42
-        )
+        # ===== 일반 TensorDataset 사용 (셔플 배치) =====
+        train_dataset = TensorDataset(X_train, y_train)
+        val_dataset = TensorDataset(X_val, y_val)
 
         train_dataloader = DataLoader(
-            train_grouped_dataset,
-            batch_sampler=train_sampler,  # batch_sampler 사용
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,  # 셔플 활성화 - 여러 BPM 파일들이 섞임
+            drop_last=True,
             num_workers=0,  # Windows에서 안정적
             pin_memory=torch.cuda.is_available()
         )
 
         val_dataloader = DataLoader(
-            val_grouped_dataset,
-            batch_sampler=val_sampler,  # batch_sampler 사용
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,  # 검증은 셔플하지 않음
+            drop_last=True,
             num_workers=0,
             pin_memory=torch.cuda.is_available()
         )
         
-        print(f"DataLoader 생성: 훈련 {len(train_grouped_dataset)}개, 검증 {len(val_grouped_dataset)}개 윈도우")
-        print(f"파일별 배치 생성: 훈련 {len(train_sampler)}개, 검증 {len(val_sampler)}개 배치")
+        print(f"DataLoader 생성: 훈련 {len(train_dataset)}개, 검증 {len(val_dataset)}개 윈도우")
         
         # 얼리 스탑 변수들
         best_val_loss = float('inf')
@@ -699,12 +684,13 @@ class BPMPredictor:
             self.model.train()
             train_loss = train_mae = batch_count = 0
             
-            for features, labels in train_dataloader:
+            for batch_idx, (features, labels) in enumerate(train_dataloader):
                 features = features.to(self.device)
                 labels = labels.squeeze().to(self.device)
                 
+                
                 optimizer.zero_grad()
-                bpm_pred, _ = self.model(features, None)
+                bpm_pred, _, lstm_out = self.model(features, None)
                 
                 # SNR + PSD + 극단 BPM 가중치 적용
                 pred = bpm_pred.squeeze()
@@ -731,14 +717,18 @@ class BPMPredictor:
                 bpm_w = torch.ones_like(true_bpm)
                 bpm_w += 0.7 * (true_bpm < 75).float() + 0.3 * (true_bpm > 95).float()
 
-                # ===== 부드러움 제약 추가 (z-score 스케일 통일) =====
-                # 라벨과 같은 z-score 스케일에서 부드러움 제약 계산
-                if pred.shape[0] > 1:  # 배치에 여러 샘플이 있는 경우만
-                    # z-score 스케일에서 연속 예측값들의 차이 계산
-                    diff = pred[1:] - pred[:-1]  # pred는 이미 z-score 정규화된 값
-                    smooth_loss = torch.abs(diff).mean()  # L1 노름
-                else:
-                    smooth_loss = torch.tensor(0.0, device=pred.device)
+                # ===== 부드러움 제약 추가 (시퀀스 내부 시간축) =====
+                # LSTM 출력의 마지막 M 스텝에서 시간축 부드러움 계산
+                # 마지막 M 스텝의 LSTM 출력에서 회귀 예측
+                step_sec = HOP_FRAMES / FS
+                M = max(1, int(round(3.0 / step_sec)))
+                M = min(M, lstm_out.size(1))
+                step_lstm = lstm_out[:, -M:, :]  # (B, M, H)
+                step_preds = self.model.regressor(step_lstm).squeeze(-1)  # (B, M)
+                
+                # 시퀀스 내부 시간축에서 연속 예측값들의 차이 계산
+                diff = step_preds[:, 1:] - step_preds[:, :-1]  # (B, M-1)
+                smooth_loss = torch.abs(diff).mean()  # L1 노름
 
                 # 최종 결합 가중치 (브로드캐스트 버그 수정)
                 # 모든 가중치를 (B,) 형태로 유지해서 element-wise 곱
@@ -747,8 +737,10 @@ class BPMPredictor:
                 bpm_w = bpm_w.view(-1)      # (B,) 확실히 보장
 
                 combined_w = bpm_w * snr_w * psd_w   # (B,), element-wise 곱
-                base = base.view(-1)   # base도 (B,) 확실히 보장
+                combined_w = combined_w / (combined_w.mean().detach() + 1e-8)  # 평균 1로 정규화
 
+                base = base.view(-1)   # base도 (B,) 확실히 보장
+                
                 data_loss = (combined_w * base).mean()
 
                 # ===== 2) data_loss, combined_w, base 분포 확인 =====
@@ -839,11 +831,12 @@ class BPMPredictor:
             val_loss = val_mae = val_batch_count = 0
             
             with torch.no_grad():
-                for features, labels in val_dataloader:
+                for batch_idx, (features, labels) in enumerate(val_dataloader):
                     features = features.to(self.device)
                     labels = labels.to(self.device)
                     
-                    bpm_pred, _ = self.model(features, None)
+                    
+                    bpm_pred, _, lstm_out = self.model(features, None)
                     
                     # ===== 검증 단계: 순수 데이터 손실만 계산 (부드러움 제약 제외) =====
                     # 검증에서는 모델 학습이 일어나지 않으므로 부드러움 제약 제외
@@ -933,7 +926,7 @@ class BPMPredictor:
                 features = self.process_window(window)
                 x = torch.FloatTensor(features).unsqueeze(0).to(self.device)
                 
-                bpm_pred, _ = self.model(x, None)
+                bpm_pred, _, _ = self.model(x, None)
                 y = bpm_pred.cpu().item()
                 # 역정규화(라벨 정규화가 존재하는 경우)
                 if (self.label_mean is not None) and (self.label_std is not None):
@@ -1130,7 +1123,7 @@ class BPMPredictor:
                 features = self.process_window(window)
                 x = torch.FloatTensor(features).unsqueeze(0).to(self.device)
                 
-                bpm_pred, _ = self.model(x, None)
+                bpm_pred, _, _ = self.model(x, None)
                 
                 # 정답 BPM 계산
                 t_end = i * FRAME_REPETITION_TIME_S
