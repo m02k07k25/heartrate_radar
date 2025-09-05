@@ -42,9 +42,6 @@ HOP_FRAMES  = int(1.0 * FS)   # 1.0초 홉 = FS 프레임
 FMIN, FMAX  = 0.8, 3.0      # 심박 대역 [Hz] (48-180 BPM에 대응) - BPF 적용
 FEATURE_DIM = HOP_FRAMES              # 1D CNN으로 압축할 특징 차원 -> 홉수
 
-# ===== 부드러움 제약 파라미터 =====
-SMOOTH_LAMBDA = 0.1           # 부드러움 제약 강도 더 증가 (데이터 손실의 5-10% 수준으로)
-
 # ===== 경로 설정 =====
 TRAIN_DATA_DIR = "record3/train/data/"
 TRAIN_ANSWER_DIR = "record3/train/answer/"
@@ -717,18 +714,6 @@ class BPMPredictor:
                 bpm_w = torch.ones_like(true_bpm)
                 bpm_w += 0.7 * (true_bpm < 75).float() + 0.3 * (true_bpm > 95).float()
 
-                # ===== 부드러움 제약 추가 (시퀀스 내부 시간축) =====
-                # LSTM 출력의 마지막 M 스텝에서 시간축 부드러움 계산
-                # 마지막 M 스텝의 LSTM 출력에서 회귀 예측
-                step_sec = HOP_FRAMES / FS
-                M = max(1, int(round(3.0 / step_sec)))
-                M = min(M, lstm_out.size(1))
-                step_lstm = lstm_out[:, -M:, :]  # (B, M, H)
-                step_preds = self.model.regressor(step_lstm).squeeze(-1)  # (B, M)
-                
-                # 시퀀스 내부 시간축에서 연속 예측값들의 차이 계산
-                diff = step_preds[:, 1:] - step_preds[:, :-1]  # (B, M-1)
-                smooth_loss = torch.abs(diff).mean()  # L1 노름
 
                 # 최종 결합 가중치 (브로드캐스트 버그 수정)
                 # 모든 가중치를 (B,) 형태로 유지해서 element-wise 곱
@@ -750,8 +735,8 @@ class BPMPredictor:
                     print(f"combined_w mean/std: {combined_w.mean().item():.4f}, {combined_w.std().item():.4f}")
                     print(f"data_loss: {data_loss.item():.4f}")
 
-                # 부드러움 제약 결합
-                loss = data_loss + SMOOTH_LAMBDA * smooth_loss
+                # 최종 손실 (부드러움 제약 제거)
+                loss = data_loss
 
                 # ===== 1) 그래디언트/파라미터 업데이트 확인 =====
                 if epoch == 0 and batch_count < 1:
@@ -779,8 +764,7 @@ class BPMPredictor:
 
                 # 디버깅: 예측값 분포 분석 (첫 에포크만)
                 if epoch == 0 and batch_count < 1:
-                    print(f"[부드러움] 데이터 손실: {data_loss.item():.3f}, 부드러움 손실(L2,z-score): {smooth_loss.item():.3f}, λ: {SMOOTH_LAMBDA}")
-                    print(f"[부드러움] 배치 크기: {pred.shape[0]}, 부드러움 적용: {'예' if pred.shape[0] > 1 else '아니오'}")
+                    print(f"[손실] 데이터 손실: {data_loss.item():.3f}")
 
                     # 예측값 분포 분석
                     pred_mean = pred.mean().item()
